@@ -390,13 +390,14 @@ def get_venues() -> list:
 # ===========================================================================
 
 # Notion側DBに用意するプロパティ（管理者が作成）:
-#   会場        : タイトル or テキスト
-#   担当者      : テキスト
+#   会場        : タイトル（会場名。1会場=1行の一意キーも兼ねる）
+#   担当者      : テキスト（スタッフ人数）
+#   イベント期間 : 日付（開始〜終了）
+#   期間目標値   : 数値（新規＋MNPの期間目標）
 #   機種変更/MNP/新規契約/LTV商材 : 数値
 #   合計        : 数値
-#   更新時刻    : テキスト or 日付
-# 会場×担当者の一意キーとして「会場 + " / " + 担当者」を _key プロパティ(テキスト)に持たせ、
-# それで既存ページを検索してupsertする。
+#   更新時刻    : テキスト
+# 会場名（タイトル）で既存ページを検索してupsertする。
 
 NOTION_API = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
@@ -425,7 +426,7 @@ def _notion_date(period_start: str, period_end: str) -> dict:
     return {"date": d}
 
 
-def _notion_props(venue, totals, total_all, staff_count, key, target, period_start, period_end) -> dict:
+def _notion_props(venue, totals, total_all, staff_count, target, period_start, period_end) -> dict:
     """会場合計をNotionのプロパティ形式に変換する。"""
     def num(v):
         return {"number": int(v)}
@@ -444,7 +445,6 @@ def _notion_props(venue, totals, total_all, staff_count, key, target, period_sta
         "LTV商材": num(totals["LTV商材"]),
         "合計": num(total_all),
         "更新時刻": txt(_now_local_iso()),
-        "_key": txt(key),
     }
 
 
@@ -474,24 +474,23 @@ def sync_breakdown_to_notion(venue: str) -> int:
             totals[c] += row[c]
     total_all = sum(totals.values())
     staff_count = len(breakdown)
-    key = venue  # 会場名そのものを一意キーに
 
     meta = get_venue_meta(venue) or {}
     target = meta.get("target", 0) or 0
     period_start = meta.get("period_start")
     period_end = meta.get("period_end")
 
-    # 既存ページ検索（_key＝会場名で一意化）
+    # 既存ページ検索（会場名＝タイトルで一意化）
     query = requests.post(
         f"{NOTION_API}/databases/{db_id}/query",
         headers=headers,
-        json={"filter": {"property": "_key", "rich_text": {"equals": key}}},
+        json={"filter": {"property": "会場", "title": {"equals": venue}}},
         timeout=15,
     )
     query.raise_for_status()
     results = query.json().get("results", [])
     props = _notion_props(
-        venue, totals, total_all, staff_count, key, target, period_start, period_end
+        venue, totals, total_all, staff_count, target, period_start, period_end
     )
 
     if results:  # 更新
