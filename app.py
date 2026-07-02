@@ -535,7 +535,7 @@ def inject_css():
         .stMarkdown h3::before {
             content: ""; position: absolute; left: 0; top: 0.18em; bottom: 0.18em;
             width: 4px; border-radius: 4px;
-            background: linear-gradient(180deg, var(--accent), #6D5DF6);
+            background: linear-gradient(180deg, #22C55E, #10B981);
         }
 
         /* メトリクスをカード化 */
@@ -547,13 +547,9 @@ def inject_css():
         [data-testid="stMetricLabel"] { opacity: 0.65; font-size: 0.78rem; font-weight: 600; }
         [data-testid="stMetricValue"] { font-size: 1.55rem; font-weight: 800; letter-spacing: -0.02em; }
 
-        /* プログレスバー */
-        [data-testid="stProgress"] > div > div {
-            height: 16px; border-radius: 999px; background: rgba(255,255,255,0.07);
-        }
-        [data-testid="stProgress"] div[role="progressbar"] > div {
-            border-radius: 999px;
-            background: linear-gradient(90deg, var(--accent), #6D5DF6) !important;
+        /* プログレスバー（塗りはテーマのprimaryColor=グリーンが自動で入る） */
+        [data-testid="stProgress"] [role="progressbar"] {
+            height: 12px; border-radius: 999px; background: rgba(255,255,255,0.08);
         }
 
         /* ボタン共通 */

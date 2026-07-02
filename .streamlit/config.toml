@@ -1,7 +1,7 @@
 # アプリの基本テーマ（プロ仕様のダーク）
 [theme]
 base = "dark"
-primaryColor = "#4F8DFD"
+primaryColor = "#22C55E"
 backgroundColor = "#0E1320"
 secondaryBackgroundColor = "#161C2B"
 textColor = "#E7ECF3"
