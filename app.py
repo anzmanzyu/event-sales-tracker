@@ -3,24 +3,20 @@
 =====================================================
 
 携帯販売のイベント現場で、スタッフがスマホからワンタップで獲得実績を入力し、
-会場全体の目標達成率をリアルタイムに共有するアプリ。
+会場全体の目標達成率（新規＋MNP）をリアルタイム共有するアプリ。
 
-■ アーキテクチャ（本番: A案）
-    スマホ（このStreamlitアプリ）
-      → Supabase（リアルタイムの本体DB / Postgres）
-      → Notion（管理者向けダッシュボード・報告用）
+■ データ単位（B案）
+    「イベント（会場 × 開催期間）」を1単位とする。
+    同じ会場でも期間が違えば別イベントとして履歴が残る（月別・期間別の振り返り可）。
+    内部キー event_key = "会場|開始日|終了日"。
 
-■ 動作モードの自動切替
-    - Supabaseの接続情報が設定されていれば「Supabaseモード」（本番）
-    - 無ければ「SQLiteモード」（ローカル検証用・従来どおり）
-    どちらでも同じUI・同じ関数で動くよう、データ層を抽象化している。
+■ アーキテクチャ
+    スマホ（Streamlit）→ Supabase（リアルタイムDB）→ Notion（管理者ダッシュボード）
+    - secretsに[supabase]があれば本番、無ければローカルSQLite（自動切替）
 
-起動方法（ローカル / SQLite）:
+起動:
     pip install -r requirements.txt
     streamlit run app.py
-
-本番（Supabase）にするには .streamlit/secrets.toml に接続情報を入れる。
-テンプレートは .streamlit/secrets.toml.example を参照。
 """
 
 import os
@@ -35,34 +31,18 @@ import streamlit.components.v1 as components
 # 定数
 # ---------------------------------------------------------------------------
 
-# 実績のカテゴリ（合算目標に対して、すべて1件としてカウントする）
 CATEGORIES = ["機種変更", "MNP", "新規契約", "LTV商材"]
+CATEGORY_ICONS = {"機種変更": "📱", "MNP": "🔁", "新規契約": "✨", "LTV商材": "💡"}
 
-# 各カテゴリのアイコン（ボタン識別用）
-CATEGORY_ICONS = {
-    "機種変更": "📱",
-    "MNP": "🔁",
-    "新規契約": "✨",
-    "LTV商材": "💡",
-}
-
-# ローカルSQLiteの保存先（Supabase未設定時のフォールバック）
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "event_sales.db")
-
-# 画面の自動更新間隔（ミリ秒）。他スタッフの入力を取り込む間隔。
 AUTO_REFRESH_MS = 5000
 
 
 # ---------------------------------------------------------------------------
-# 設定（secrets）ヘルパー
+# 設定（secrets）・共通ヘルパー
 # ---------------------------------------------------------------------------
 
 def _secrets_section(name: str):
-    """st.secrets の任意セクションを安全に取得する（無ければ None）。
-
-    ローカルで secrets.toml が無い場合、st.secrets へのアクセスは
-    例外を投げるため try で握りつぶす。
-    """
     try:
         if name in st.secrets:
             return st.secrets[name]
@@ -72,8 +52,6 @@ def _secrets_section(name: str):
 
 
 def get_backend_mode() -> str:
-    """使用するデータ層を判定する。"supabase" or "sqlite"。"""
-    # 環境変数での明示指定を優先（テスト・ローカル用）
     forced = os.environ.get("EVENT_APP_BACKEND")
     if forced in ("sqlite", "supabase"):
         return forced
@@ -81,16 +59,10 @@ def get_backend_mode() -> str:
 
 
 def auth_required() -> bool:
-    """secrets に [auth] pin があればログインを要求する。
-
-    ローカル検証（secretsに[auth]なし）では要求しない＝そのまま開ける。
-    Streamlit Cloudの公開URLは誰でも開けてしまうため、本番では必ず設定する。
-    """
     return _secrets_section("auth") is not None
 
 
 def check_pin(entered: str) -> bool:
-    """入力PINが会場共通の合言葉と一致するか。"""
     conf = _secrets_section("auth")
     if not conf:
         return True
@@ -105,14 +77,29 @@ def _now_local_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def make_event_key(venue: str, period_start: str, period_end: str) -> str:
+    """イベントの一意キー（会場×期間）。"""
+    return f"{venue}|{period_start}|{period_end}"
+
+
+def fmt_period(period_start: str, period_end: str) -> str:
+    """'2026-07-13'〜'2026-07-15' を '2026/07/13〜2026/07/15' に整形（単日は片方のみ）。"""
+    if not period_start:
+        return ""
+    s = period_start.replace("-", "/")
+    if period_end and period_end != period_start:
+        s += "〜" + period_end.replace("-", "/")
+    return s
+
+
 # ===========================================================================
 # データ層（バックエンド）
-#   - どちらのバックエンドも同じメソッド名・同じ戻り値の形をそろえている
-#   - UI側は get_backend() 経由で呼ぶだけで、中身の違いを意識しない
+#   config表（venues）: event_key(PK), venue, target, period_start, period_end
+#   tap表  （events） : id, event_key, venue, staff, category, delta, created_at
 # ===========================================================================
 
 class SQLiteBackend:
-    """ローカル検証用。1台のPC上のSQLiteファイルを共有する。"""
+    """ローカル検証用。"""
 
     def __init__(self, db_path: str):
         self.db_path = db_path
@@ -129,7 +116,8 @@ class SQLiteBackend:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS venues (
-                    venue        TEXT PRIMARY KEY,
+                    event_key    TEXT PRIMARY KEY,
+                    venue        TEXT NOT NULL,
                     target       INTEGER NOT NULL DEFAULT 0,
                     period_start TEXT,
                     period_end   TEXT,
@@ -141,6 +129,7 @@ class SQLiteBackend:
                 """
                 CREATE TABLE IF NOT EXISTS events (
                     id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_key  TEXT    NOT NULL,
                     venue      TEXT    NOT NULL,
                     staff      TEXT    NOT NULL,
                     category   TEXT    NOT NULL,
@@ -149,91 +138,91 @@ class SQLiteBackend:
                 )
                 """
             )
-            conn.execute("CREATE INDEX IF NOT EXISTS idx_events_venue ON events(venue)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_events_key ON events(event_key)")
 
-    def set_venue(self, venue: str, target: int, period_start: str, period_end: str):
+    def set_event(self, event_key, venue, target, period_start, period_end):
         with closing(self._conn()) as conn, conn:
             conn.execute(
                 """
-                INSERT INTO venues (venue, target, period_start, period_end, updated_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(venue) DO UPDATE SET
+                INSERT INTO venues (event_key, venue, target, period_start, period_end, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(event_key) DO UPDATE SET
+                    venue = excluded.venue,
                     target = excluded.target,
                     period_start = excluded.period_start,
                     period_end = excluded.period_end,
                     updated_at = excluded.updated_at
                 """,
-                (venue, int(target), period_start, period_end, _now_local_iso()),
+                (event_key, venue, int(target), period_start, period_end, _now_local_iso()),
             )
 
-    def get_venue_meta(self, venue: str):
+    def get_event_meta(self, event_key):
         with closing(self._conn()) as conn:
             row = conn.execute(
-                "SELECT target, period_start, period_end FROM venues WHERE venue = ?",
-                (venue,),
+                "SELECT venue, target, period_start, period_end FROM venues WHERE event_key = ?",
+                (event_key,),
             ).fetchone()
         if not row:
             return None
-        return {"target": int(row[0]), "period_start": row[1], "period_end": row[2]}
+        return {"venue": row[0], "target": int(row[1]), "period_start": row[2], "period_end": row[3]}
 
-    def record_event(self, venue: str, staff: str, category: str, delta: int):
+    def list_events(self):
+        with closing(self._conn()) as conn:
+            rows = conn.execute(
+                """
+                SELECT event_key, venue, period_start, period_end, target
+                FROM venues ORDER BY period_start DESC, venue
+                """
+            ).fetchall()
+        return [
+            {"event_key": r[0], "venue": r[1], "period_start": r[2], "period_end": r[3], "target": int(r[4])}
+            for r in rows
+        ]
+
+    def record_event(self, event_key, venue, staff, category, delta):
         with closing(self._conn()) as conn, conn:
             conn.execute(
                 """
-                INSERT INTO events (venue, staff, category, delta, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO events (event_key, venue, staff, category, delta, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (venue, staff, category, int(delta), _now_local_iso()),
+                (event_key, venue, staff, category, int(delta), _now_local_iso()),
             )
 
-    def _venue_events(self, venue: str, staff: str = None):
-        """会場（と任意でスタッフ）に絞ったイベント行を返す。"""
-        sql = "SELECT staff, category, delta FROM events WHERE venue = ?"
-        params = [venue]
+    def _event_rows(self, event_key, staff=None):
+        sql = "SELECT staff, category, delta FROM events WHERE event_key = ?"
+        params = [event_key]
         if staff is not None:
             sql += " AND staff = ?"
             params.append(staff)
         with closing(self._conn()) as conn:
             return conn.execute(sql, params).fetchall()
 
-    def get_venue_total(self, venue: str) -> int:
-        return sum(r[2] for r in self._venue_events(venue))
+    def get_total(self, event_key):
+        return sum(r[2] for r in self._event_rows(event_key))
 
-    def get_my_counts(self, venue: str, staff: str) -> dict:
+    def get_my_counts(self, event_key, staff):
         counts = {c: 0 for c in CATEGORIES}
-        for _staff, category, delta in self._venue_events(venue, staff):
+        for _s, category, delta in self._event_rows(event_key, staff):
             if category in counts:
                 counts[category] += int(delta)
         return counts
 
-    def get_breakdown(self, venue: str) -> list:
-        return _aggregate_breakdown(self._venue_events(venue))
-
-    def get_venues(self) -> list:
-        with closing(self._conn()) as conn:
-            rows = conn.execute(
-                "SELECT venue FROM venues ORDER BY venue"
-            ).fetchall()
-        return [r[0] for r in rows]
+    def get_breakdown(self, event_key):
+        return _aggregate_breakdown(self._event_rows(event_key))
 
 
 class SupabaseBackend:
-    """本番用。Supabase(Postgres)を共有DBとして使う。
-
-    集計（合計・内訳）は、会場に絞ったイベント行を取得してPython側で
-    合算する方式（RPC/ビュー不要でスキーマがシンプル）。規模が大きく
-    なったらPostgres側のビュー/集計関数に寄せる余地を残している。
-    """
+    """本番用（Supabase/Postgres）。集計はPython側で合算。"""
 
     def __init__(self, url: str, key: str):
-        # supabase-py は遅延import（ローカルSQLite運用では不要なため）
         from supabase import create_client
-
         self.client = create_client(url, key)
 
-    def set_venue(self, venue: str, target: int, period_start: str, period_end: str):
+    def set_event(self, event_key, venue, target, period_start, period_end):
         self.client.table("venues").upsert(
             {
+                "event_key": event_key,
                 "venue": venue,
                 "target": int(target),
                 "period_start": period_start,
@@ -242,26 +231,46 @@ class SupabaseBackend:
             }
         ).execute()
 
-    def get_venue_meta(self, venue: str):
+    def get_event_meta(self, event_key):
         res = (
             self.client.table("venues")
-            .select("target,period_start,period_end")
-            .eq("venue", venue)
+            .select("venue,target,period_start,period_end")
+            .eq("event_key", event_key)
             .limit(1)
             .execute()
         )
         if res.data:
             r = res.data[0]
             return {
+                "venue": r["venue"],
                 "target": int(r["target"]),
                 "period_start": r.get("period_start"),
                 "period_end": r.get("period_end"),
             }
         return None
 
-    def record_event(self, venue: str, staff: str, category: str, delta: int):
+    def list_events(self):
+        res = (
+            self.client.table("venues")
+            .select("event_key,venue,period_start,period_end,target")
+            .order("period_start", desc=True)
+            .execute()
+        )
+        return [
+            {
+                "event_key": r["event_key"],
+                "venue": r["venue"],
+                "period_start": r.get("period_start"),
+                "period_end": r.get("period_end"),
+                "target": int(r["target"]),
+            }
+            for r in (res.data or [])
+        ]
+
+    def record_event(self, event_key, venue, staff, category, delta):
         self.client.table("events").insert(
             {
+                "event_key": event_key,
                 "venue": venue,
                 "staff": staff,
                 "category": category,
@@ -270,54 +279,41 @@ class SupabaseBackend:
             }
         ).execute()
 
-    def _venue_events(self, venue: str, staff: str = None):
-        q = (
-            self.client.table("events")
-            .select("staff,category,delta")
-            .eq("venue", venue)
-        )
+    def _event_rows(self, event_key, staff=None):
+        q = self.client.table("events").select("staff,category,delta").eq("event_key", event_key)
         if staff is not None:
             q = q.eq("staff", staff)
         res = q.execute()
         return [(r["staff"], r["category"], r["delta"]) for r in (res.data or [])]
 
-    def get_venue_total(self, venue: str) -> int:
-        return sum(r[2] for r in self._venue_events(venue))
+    def get_total(self, event_key):
+        return sum(r[2] for r in self._event_rows(event_key))
 
-    def get_my_counts(self, venue: str, staff: str) -> dict:
+    def get_my_counts(self, event_key, staff):
         counts = {c: 0 for c in CATEGORIES}
-        for _staff, category, delta in self._venue_events(venue, staff):
+        for _s, category, delta in self._event_rows(event_key, staff):
             if category in counts:
                 counts[category] += int(delta)
         return counts
 
-    def get_breakdown(self, venue: str) -> list:
-        return _aggregate_breakdown(self._venue_events(venue))
-
-    def get_venues(self) -> list:
-        res = self.client.table("venues").select("venue").order("venue").execute()
-        return [r["venue"] for r in (res.data or [])]
+    def get_breakdown(self, event_key):
+        return _aggregate_breakdown(self._event_rows(event_key))
 
 
 def _aggregate_breakdown(rows) -> list:
-    """(staff, category, delta) の行リストをスタッフ別内訳に集約する。
-
-    戻り値: [{"担当者": 名前, "機種変更": n, ..., "合計": n}, ...]（合計降順）
-    """
+    """(staff, category, delta) をスタッフ別内訳に集約（合計降順）。"""
     table = {}
     for staff, category, delta in rows:
         if staff not in table:
             table[staff] = {c: 0 for c in CATEGORIES}
         if category in table[staff]:
             table[staff][category] += int(delta)
-
     result = []
     for staff, counts in table.items():
         row = {"担当者": staff}
         row.update(counts)
         row["合計"] = sum(counts.values())
         result.append(row)
-
     result.sort(key=lambda r: r["合計"], reverse=True)
     return result
 
@@ -328,7 +324,6 @@ _SUPABASE_BACKEND = None
 
 
 def _get_supabase_backend():
-    """Supabaseバックエンドを1度だけ生成して使い回す。"""
     global _SUPABASE_BACKEND
     if _SUPABASE_BACKEND is None:
         conf = _secrets_section("supabase")
@@ -337,67 +332,50 @@ def _get_supabase_backend():
 
 
 def get_backend():
-    """現在のモードに応じたバックエンドを返す。"""
     if get_backend_mode() == "supabase":
         return _get_supabase_backend()
-    # SQLiteは生成が軽いので都度作る（DB_PATH差し替えにも追従できる）
     return SQLiteBackend(DB_PATH)
 
 
-# --- UI側から呼ぶ薄いラッパー（呼び名は従来どおり据え置き） -----------------
+# --- UI側から呼ぶ薄いラッパー ----------------------------------------------
 
 def init_db():
-    get_backend()  # 生成時にテーブル自動作成（SQLite）
+    get_backend()
 
 
-def set_venue(venue: str, target: int, period_start: str, period_end: str):
-    get_backend().set_venue(venue, int(target), period_start, period_end)
+def set_event(event_key, venue, target, period_start, period_end):
+    get_backend().set_event(event_key, venue, int(target), period_start, period_end)
 
 
-def get_venue_meta(venue: str):
-    return get_backend().get_venue_meta(venue)
+def get_event_meta(event_key):
+    return get_backend().get_event_meta(event_key)
 
 
-def record_event(venue: str, staff: str, category: str, delta: int):
-    get_backend().record_event(venue, staff, category, int(delta))
-    # 将来のNotion同期フックはここではなく、レート制限を避けるため
-    # 「集約→定期同期」方式にした（sync_breakdown_to_notion を参照）。
+def list_events():
+    return get_backend().list_events()
 
 
-def get_venue_total(venue: str) -> int:
-    return get_backend().get_venue_total(venue)
+def record_event(event_key, venue, staff, category, delta):
+    get_backend().record_event(event_key, venue, staff, category, int(delta))
 
 
-def get_my_counts(venue: str, staff: str) -> dict:
-    return get_backend().get_my_counts(venue, staff)
+def get_total(event_key):
+    return get_backend().get_total(event_key)
 
 
-def get_breakdown(venue: str) -> list:
-    return get_backend().get_breakdown(venue)
+def get_my_counts(event_key, staff):
+    return get_backend().get_my_counts(event_key, staff)
 
 
-def get_venues() -> list:
-    return get_backend().get_venues()
+def get_breakdown(event_key):
+    return get_backend().get_breakdown(event_key)
 
 
 # ===========================================================================
 # Notion同期（管理者ダッシュボード向け）
-#   設計方針:
-#     - 「+1」タップ1件ずつは送らない（Notion APIは約3req/秒制限のため）
-#     - 代わりに「会場×スタッフ＝1行」に集約し、合計値を定期upsertする
-#     - これでNotionは常に最新の内訳スナップショットを保持し、行も膨らまない
-#   ※ライブ疎通テストはNotionトークン投入後（S2）に実施する
+#   1イベント（会場×期間）＝1行。event_key（非表示の_key列）でupsert。
+#   連打は送らず、管理者の手動ボタン or 締めで同期する想定（レート制限回避）。
 # ===========================================================================
-
-# Notion側DBに用意するプロパティ（管理者が作成）:
-#   会場        : タイトル（会場名。1会場=1行の一意キーも兼ねる）
-#   担当者      : テキスト（スタッフ人数）
-#   イベント期間 : 日付（開始〜終了）
-#   期間目標値   : 数値（新規＋MNPの期間目標）
-#   機種変更/MNP/新規契約/LTV商材 : 数値
-#   合計        : 数値
-#   更新時刻    : テキスト
-# 会場名（タイトル）で既存ページを検索してupsertする。
 
 NOTION_API = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
@@ -416,8 +394,7 @@ def _notion_headers():
     }
 
 
-def _notion_date(period_start: str, period_end: str) -> dict:
-    """開始〜終了をNotionの日付プロパティ形式に変換する（単日なら開始のみ）。"""
+def _notion_date(period_start, period_end):
     if not period_start:
         return {"date": None}
     d = {"start": period_start}
@@ -426,8 +403,7 @@ def _notion_date(period_start: str, period_end: str) -> dict:
     return {"date": d}
 
 
-def _notion_props(venue, totals, total_all, staff_count, target, period_start, period_end) -> dict:
-    """会場合計をNotionのプロパティ形式に変換する。"""
+def _notion_props(venue, totals, total_all, staff_count, target, period_start, period_end, event_key):
     def num(v):
         return {"number": int(v)}
 
@@ -436,38 +412,36 @@ def _notion_props(venue, totals, total_all, staff_count, target, period_start, p
 
     return {
         "会場": {"title": [{"text": {"content": venue}}]},
-        "担当者": txt(f"{staff_count}名"),  # 会場に立っているスタッフ人数
+        "担当者": txt(f"{staff_count}名"),
         "イベント期間": _notion_date(period_start, period_end),
-        "期間目標値": num(target),  # 新規＋MNPの期間目標
+        "期間目標値": num(target),
         "機種変更": num(totals["機種変更"]),
         "MNP": num(totals["MNP"]),
         "新規契約": num(totals["新規契約"]),
         "LTV商材": num(totals["LTV商材"]),
         "合計": num(total_all),
         "更新時刻": txt(_now_local_iso()),
+        "_key": txt(event_key),  # 会場×期間の一意キー（非表示推奨）
     }
 
 
-def sync_breakdown_to_notion(venue: str) -> int:
-    """会場ごとに1行へ集約してNotionへ同期する（会場名＝一意キー）。
-
-    全スタッフ分を会場単位で合算し、1ページに upsert（あれば更新・無ければ作成）。
-    戻り値: 同期した会場数（0 or 1）。未設定時は 0（no-op）。
-    """
+def sync_event_to_notion(event_key: str) -> int:
+    """1イベント（会場×期間）を1行へ集約してNotionへupsert。未設定時は0。"""
     if not notion_configured():
         print("[notion] 未設定のためスキップ（ローカル検証モード）")
         return 0
 
-    import requests  # 遅延import
+    import requests
 
     conf = _secrets_section("notion")
     db_id = conf["database_id"]
     headers = _notion_headers()
-    breakdown = get_breakdown(venue)
-    if not breakdown:
-        return 0
 
-    # 全スタッフ分を会場単位で合算
+    meta = get_event_meta(event_key)
+    if not meta:
+        return 0
+    breakdown = get_breakdown(event_key)
+
     totals = {c: 0 for c in CATEGORIES}
     for row in breakdown:
         for c in CATEGORIES:
@@ -475,33 +449,26 @@ def sync_breakdown_to_notion(venue: str) -> int:
     total_all = sum(totals.values())
     staff_count = len(breakdown)
 
-    meta = get_venue_meta(venue) or {}
-    target = meta.get("target", 0) or 0
-    period_start = meta.get("period_start")
-    period_end = meta.get("period_end")
+    props = _notion_props(
+        meta["venue"], totals, total_all, staff_count,
+        meta["target"], meta["period_start"], meta["period_end"], event_key,
+    )
 
-    # 既存ページ検索（会場名＝タイトルで一意化）
     query = requests.post(
         f"{NOTION_API}/databases/{db_id}/query",
         headers=headers,
-        json={"filter": {"property": "会場", "title": {"equals": venue}}},
+        json={"filter": {"property": "_key", "rich_text": {"equals": event_key}}},
         timeout=15,
     )
     query.raise_for_status()
     results = query.json().get("results", [])
-    props = _notion_props(
-        venue, totals, total_all, staff_count, target, period_start, period_end
-    )
 
-    if results:  # 更新
-        page_id = results[0]["id"]
+    if results:
         resp = requests.patch(
-            f"{NOTION_API}/pages/{page_id}",
-            headers=headers,
-            json={"properties": props},
-            timeout=15,
+            f"{NOTION_API}/pages/{results[0]['id']}",
+            headers=headers, json={"properties": props}, timeout=15,
         )
-    else:  # 新規作成
+    else:
         resp = requests.post(
             f"{NOTION_API}/pages",
             headers=headers,
@@ -513,30 +480,22 @@ def sync_breakdown_to_notion(venue: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# 画面自動更新（他スタッフの入力を定期反映）
+# 画面自動更新
 # ---------------------------------------------------------------------------
 
 def do_autorefresh(interval_ms: int, key: str):
-    """画面を定期的に再実行して最新データを取り込む。"""
     try:
         from streamlit_autorefresh import st_autorefresh
-
         st_autorefresh(interval=interval_ms, key=key)
     except Exception:
         components.html(
-            f"""
-            <script>
-                setTimeout(function() {{
-                    window.parent.location.reload();
-                }}, {interval_ms});
-            </script>
-            """,
+            f"<script>setTimeout(function(){{window.parent.location.reload();}}, {interval_ms});</script>",
             height=0,
         )
 
 
 # ---------------------------------------------------------------------------
-# UI: スタイル（大きなボタン・モバイル最適化）
+# スタイル
 # ---------------------------------------------------------------------------
 
 def inject_css():
@@ -545,18 +504,12 @@ def inject_css():
         <style>
         .block-container { padding-top: 1.2rem; padding-bottom: 3rem; }
         div.stButton > button[kind="primary"] {
-            height: 5.2rem;
-            font-size: 1.35rem;
-            font-weight: 700;
-            border-radius: 16px;
-            width: 100%;
+            height: 5.2rem; font-size: 1.35rem; font-weight: 700;
+            border-radius: 16px; width: 100%;
         }
         div.stButton > button[kind="secondary"] {
-            height: 2.0rem;
-            font-size: 0.85rem;
-            border-radius: 10px;
-            width: 100%;
-            opacity: 0.75;
+            height: 2.0rem; font-size: 0.85rem; border-radius: 10px;
+            width: 100%; opacity: 0.75;
         }
         </style>
         """,
@@ -565,7 +518,7 @@ def inject_css():
 
 
 # ---------------------------------------------------------------------------
-# 画面0: ログイン（会場共通PIN）
+# 画面0: ログイン
 # ---------------------------------------------------------------------------
 
 def render_login():
@@ -583,7 +536,7 @@ def render_login():
 
 
 # ---------------------------------------------------------------------------
-# 画面1: 初期設定（セッション開始）
+# 画面1: 初期設定（イベント選択 or 新規）
 # ---------------------------------------------------------------------------
 
 def render_setup():
@@ -593,55 +546,38 @@ def render_setup():
         "イベント現場のリアルタイム実績共有"
         + ("　｜　☁ Supabase接続中" if mode == "supabase" else "　｜　💾 ローカル検証モード")
     )
-
     st.subheader("セッションを開始")
 
-    # 既存の会場があればプルダウンで選べる（表記ゆれ・入力ミスによる会場分裂を防ぐ）
-    existing = get_venues()
-    NEW_LABEL = "＋ 新しい会場を入力"
-    if existing:
-        choice = st.selectbox("イベント会場名", [NEW_LABEL] + existing)
-        if choice == NEW_LABEL:
-            venue = st.text_input("新しい会場名", placeholder="例：高松ゆめタウン特設ブース")
-        else:
-            venue = choice
+    events = list_events()
+    NEW_LABEL = "＋ 新しいイベント"
+    labels = [NEW_LABEL] + [f"{e['venue']}（{fmt_period(e['period_start'], e['period_end'])}）" for e in events]
+    choice = st.selectbox("イベントを選択（続きから／新規）", labels)
+
+    today = date.today()
+    if choice == NEW_LABEL:
+        venue = st.text_input("会場名", placeholder="例：高松ゆめタウン特設ブース")
+        c1, c2 = st.columns(2)
+        period_start = c1.date_input("開始日", value=today, format="YYYY/MM/DD")
+        period_end = c2.date_input("終了日", value=today, format="YYYY/MM/DD")
+        target = st.number_input(
+            "期間目標値（新規＋MNPの合計目標件数）",
+            min_value=1, max_value=100000, value=30, step=1,
+            help="この派遣期間トータルの「新規＋MNP」の目標件数です。",
+        )
     else:
-        venue = st.text_input("イベント会場名", placeholder="例：高松ゆめタウン特設ブース")
+        e = events[labels.index(choice) - 1]
+        venue = e["venue"]
+        period_start = date.fromisoformat(e["period_start"]) if e["period_start"] else today
+        period_end = date.fromisoformat(e["period_end"]) if e["period_end"] else today
+        target = e["target"]
+        st.info(
+            f"会場：{venue}\n\n期間：{fmt_period(e['period_start'], e['period_end'])}"
+            f"\n\n期間目標値（新規＋MNP）：{target} 件"
+        )
 
     staff = st.text_input("担当者名（あなたの名前）", placeholder="例：並木")
 
-    # 既存会場を選んだ場合は、その目標・期間を初期値に（誤って上書きしないため）
-    today = date.today()
-    default_target, default_start, default_end = 30, today, today
-    if venue and venue in existing:
-        meta = get_venue_meta(venue)
-        if meta:
-            default_target = meta["target"] or 30
-            if meta.get("period_start"):
-                try:
-                    default_start = date.fromisoformat(meta["period_start"])
-                except ValueError:
-                    pass
-            if meta.get("period_end"):
-                try:
-                    default_end = date.fromisoformat(meta["period_end"])
-                except ValueError:
-                    pass
-
-    c1, c2 = st.columns(2)
-    period_start = c1.date_input("イベント開始日", value=default_start, format="YYYY/MM/DD")
-    period_end = c2.date_input("イベント終了日", value=default_end, format="YYYY/MM/DD")
-
-    target = st.number_input(
-        "期間目標値（新規＋MNPの合計目標件数）",
-        min_value=1,
-        max_value=100000,
-        value=int(default_target),
-        step=1,
-        help="この派遣期間トータルの「新規＋MNP」の目標件数です。会場のスタッフで共有され、あとから変更もできます。",
-    )
-
-    if st.button("この会場で開始する", type="primary", use_container_width=True):
+    if st.button("このイベントで開始する", type="primary", use_container_width=True):
         if not venue or not venue.strip() or not staff.strip():
             st.error("会場名と担当者名を入力してください。")
             return
@@ -651,8 +587,11 @@ def render_setup():
 
         venue = venue.strip()
         staff = staff.strip()
-        set_venue(venue, int(target), period_start.isoformat(), period_end.isoformat())
+        ps, pe = period_start.isoformat(), period_end.isoformat()
+        event_key = make_event_key(venue, ps, pe)
+        set_event(event_key, venue, int(target), ps, pe)
 
+        st.session_state["event_key"] = event_key
         st.session_state["venue"] = venue
         st.session_state["staff"] = staff
         st.session_state["configured"] = True
@@ -660,24 +599,19 @@ def render_setup():
 
 
 # ---------------------------------------------------------------------------
-# 画面2: メイン（入力 + ダッシュボードが1画面で完結）
+# 画面2: メイン（入力 + ダッシュボード）
 # ---------------------------------------------------------------------------
 
 def render_main():
+    event_key = st.session_state["event_key"]
     venue = st.session_state["venue"]
     staff = st.session_state["staff"]
 
     do_autorefresh(AUTO_REFRESH_MS, key="dashboard_refresh")
 
-    meta = get_venue_meta(venue) or {}
+    meta = get_event_meta(event_key) or {}
     target = meta.get("target", 0) or 0
-    period_start = meta.get("period_start")
-    period_end = meta.get("period_end")
-    period_label = ""
-    if period_start:
-        period_label = period_start.replace("-", "/")
-        if period_end and period_end != period_start:
-            period_label += "〜" + period_end.replace("-", "/")
+    period_label = fmt_period(meta.get("period_start"), meta.get("period_end"))
 
     # ===== ヘッダー =====
     top_l, top_r = st.columns([3, 1])
@@ -693,10 +627,10 @@ def render_main():
             st.session_state["configured"] = False
             st.rerun()
 
-    # ===== リアルタイムダッシュボード（新規＋MNP を目標に）=====
-    breakdown = get_breakdown(venue)
-    nm_total = sum(r["MNP"] + r["新規契約"] for r in breakdown)  # 新規＋MNP
-    all_total = get_venue_total(venue)  # 全商材合計（参考）
+    # ===== ダッシュボード（新規＋MNP を目標に）=====
+    breakdown = get_breakdown(event_key)
+    nm_total = sum(r["MNP"] + r["新規契約"] for r in breakdown)
+    all_total = get_total(event_key)
     rate = (nm_total / target * 100) if target > 0 else 0.0
     remaining = max(target - nm_total, 0)
 
@@ -714,9 +648,9 @@ def render_main():
 
     st.divider()
 
-    # ===== 実績入力（自分の入力） =====
+    # ===== 実績入力 =====
     st.markdown(f"### ➕ 実績を入力（{staff} さん）")
-    my_counts = get_my_counts(venue, staff)
+    my_counts = get_my_counts(event_key, staff)
 
     grid = [CATEGORIES[i:i + 2] for i in range(0, len(CATEGORIES), 2)]
     for row in grid:
@@ -727,35 +661,27 @@ def render_main():
                 current = my_counts.get(category, 0)
                 if st.button(
                     f"{icon} {category}\n＋1（現在 {current}）",
-                    key=f"plus_{category}",
-                    type="primary",
-                    use_container_width=True,
+                    key=f"plus_{category}", type="primary", use_container_width=True,
                 ):
-                    record_event(venue, staff, category, +1)
+                    record_event(event_key, venue, staff, category, +1)
                     st.rerun()
                 if st.button(
-                    "−1 修正",
-                    key=f"minus_{category}",
-                    type="secondary",
-                    use_container_width=True,
+                    "−1 修正", key=f"minus_{category}",
+                    type="secondary", use_container_width=True,
                 ):
                     if current > 0:
-                        record_event(venue, staff, category, -1)
+                        record_event(event_key, venue, staff, category, -1)
                     st.rerun()
 
-    my_total = sum(my_counts.values())
-    st.caption(f"あなたの合計：{my_total} 件")
-
+    st.caption(f"あなたの合計：{sum(my_counts.values())} 件")
     st.divider()
 
-    # ===== スタッフ別の内訳一覧 =====
+    # ===== スタッフ別の内訳 =====
     st.markdown("### 👥 スタッフ別の内訳")
-    breakdown = get_breakdown(venue)
     if not breakdown:
         st.info("まだ実績がありません。最初の1件を入力してみましょう。")
     else:
         import pandas as pd
-
         df = pd.DataFrame(breakdown)
         col_order = ["担当者"] + CATEGORIES + ["合計"]
         df = df[[c for c in col_order if c in df.columns]]
@@ -765,11 +691,11 @@ def render_main():
     if notion_configured():
         st.divider()
         with st.expander("🗂 管理者用：Notionへ同期"):
-            st.caption("会場×スタッフの合計をNotionへ集約送信します（報告用）。")
+            st.caption("このイベント（会場×期間）の合計をNotionへ送信します（報告用）。")
             if st.button("今すぐNotionに同期する"):
                 try:
-                    n = sync_breakdown_to_notion(venue)
-                    st.success(f"Notionへ {n} 名分を同期しました。")
+                    n = sync_event_to_notion(event_key)
+                    st.success(f"Notionへ {n} 件同期しました。")
                 except Exception as e:
                     st.error(f"同期に失敗しました: {e}")
 
@@ -780,15 +706,12 @@ def render_main():
 
 def main():
     st.set_page_config(
-        page_title="実績入力アプリ",
-        page_icon="📲",
-        layout="centered",
-        initial_sidebar_state="collapsed",
+        page_title="実績入力アプリ", page_icon="📲",
+        layout="centered", initial_sidebar_state="collapsed",
     )
     inject_css()
     init_db()
 
-    # 公開URLの野良アクセス対策：PIN設定時はログインを要求
     if auth_required() and not st.session_state.get("authed"):
         render_login()
         return
