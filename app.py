@@ -33,6 +33,8 @@ import streamlit.components.v1 as components
 
 CATEGORIES = ["機種変更", "MNP", "新規契約", "LTV商材"]
 CATEGORY_ICONS = {"機種変更": "📱", "MNP": "🔁", "新規契約": "✨", "LTV商材": "💡"}
+# CSSで色分けするためのASCIIスラッグ（.st-key-plus_<slug> で狙い撃ちできる）
+CATEGORY_SLUG = {"機種変更": "kishu", "MNP": "mnp", "新規契約": "shinki", "LTV商材": "ltv"}
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "event_sales.db")
 AUTO_REFRESH_MS = 5000
@@ -502,15 +504,95 @@ def inject_css():
     st.markdown(
         """
         <style>
-        .block-container { padding-top: 1.2rem; padding-bottom: 3rem; }
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+
+        :root {
+            --card: #161C2B;
+            --card-border: rgba(255,255,255,0.07);
+            --accent: #4F8DFD;
+            --muted: #9AA6BF;
+            --c-kishu: #3B82F6;   /* 機種変更 */
+            --c-mnp:   #8B5CF6;   /* MNP */
+            --c-shinki:#10B981;   /* 新規契約 */
+            --c-ltv:   #F59E0B;   /* LTV商材 */
+        }
+
+        /* 全体のフォント・背景 */
+        html, body, [class*="css"], .stApp { font-family: 'Inter', system-ui, sans-serif; }
+        .stApp { background: linear-gradient(180deg, #0E1320 0%, #0B0F1A 100%); }
+        .block-container { max-width: 680px; padding-top: 1.1rem; padding-bottom: 3.5rem; }
+
+        /* Streamlitの余計なクロームを隠してスッキリ */
+        #MainMenu, footer, [data-testid="stDecoration"] { display: none; }
+        [data-testid="stHeader"] { background: transparent; }
+
+        /* 見出し */
+        h1, h2, h3 { font-weight: 800; letter-spacing: -0.01em; }
+        .stMarkdown h3 {
+            position: relative; padding-left: 0.7rem; margin-top: 0.4rem;
+            font-size: 1.05rem; color: #EDF1F8;
+        }
+        .stMarkdown h3::before {
+            content: ""; position: absolute; left: 0; top: 0.18em; bottom: 0.18em;
+            width: 4px; border-radius: 4px;
+            background: linear-gradient(180deg, var(--accent), #6D5DF6);
+        }
+
+        /* メトリクスをカード化 */
+        [data-testid="stMetric"] {
+            background: var(--card); border: 1px solid var(--card-border);
+            border-radius: 16px; padding: 14px 14px 10px;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.25);
+        }
+        [data-testid="stMetricLabel"] { opacity: 0.65; font-size: 0.78rem; font-weight: 600; }
+        [data-testid="stMetricValue"] { font-size: 1.55rem; font-weight: 800; letter-spacing: -0.02em; }
+
+        /* プログレスバー */
+        [data-testid="stProgress"] > div > div {
+            height: 16px; border-radius: 999px; background: rgba(255,255,255,0.07);
+        }
+        [data-testid="stProgress"] div[role="progressbar"] > div {
+            border-radius: 999px;
+            background: linear-gradient(90deg, var(--accent), #6D5DF6) !important;
+        }
+
+        /* ボタン共通 */
+        div.stButton > button {
+            border: none; transition: transform .06s ease, box-shadow .2s ease, filter .2s ease;
+        }
+        div.stButton > button:active { transform: translateY(1px) scale(0.995); }
+
+        /* ＋1 の大ボタン（primary） */
         div.stButton > button[kind="primary"] {
-            height: 5.2rem; font-size: 1.35rem; font-weight: 700;
-            border-radius: 16px; width: 100%;
+            height: 5.4rem; font-size: 1.3rem; font-weight: 800;
+            border-radius: 18px; width: 100%; color: #fff;
+            white-space: pre-line; line-height: 1.25;
+            background: linear-gradient(180deg, #4F8DFD 0%, #3D6FE0 100%);
+            box-shadow: 0 8px 20px rgba(79,141,253,0.28);
         }
+        div.stButton > button[kind="primary"]:hover { filter: brightness(1.07); }
+
+        /* −1 修正（secondary） */
         div.stButton > button[kind="secondary"] {
-            height: 2.0rem; font-size: 0.85rem; border-radius: 10px;
-            width: 100%; opacity: 0.75;
+            height: 2.1rem; font-size: 0.82rem; border-radius: 10px; width: 100%;
+            color: var(--muted); background: rgba(255,255,255,0.04);
+            border: 1px solid var(--card-border);
         }
+        div.stButton > button[kind="secondary"]:hover { color: #fff; background: rgba(255,255,255,0.09); }
+
+        /* 4商材ボタンを色分け（keyのst-key-クラスで狙い撃ち・!importantで確実に上書き） */
+        .st-key-plus_kishu  button[kind="primary"] { background: linear-gradient(180deg,#3B82F6,#2E6AD6) !important; box-shadow:0 8px 20px rgba(59,130,246,0.30) !important; }
+        .st-key-plus_mnp    button[kind="primary"] { background: linear-gradient(180deg,#8B5CF6,#7248D9) !important; box-shadow:0 8px 20px rgba(139,92,246,0.30) !important; }
+        .st-key-plus_shinki button[kind="primary"] { background: linear-gradient(180deg,#10B981,#0C9A6C) !important; box-shadow:0 8px 20px rgba(16,185,129,0.30) !important; }
+        .st-key-plus_ltv    button[kind="primary"] { background: linear-gradient(180deg,#F59E0B,#D9860A) !important; box-shadow:0 8px 20px rgba(245,158,11,0.30) !important; }
+
+        /* 入力・セレクト・expander */
+        [data-testid="stExpander"] { border: 1px solid var(--card-border); border-radius: 14px; background: var(--card); }
+        [data-testid="stDataFrame"] { border-radius: 12px; overflow: hidden; }
+        .stTextInput input, .stNumberInput input, [data-baseweb="select"] > div {
+            border-radius: 10px !important;
+        }
+        hr { margin: 1.1rem 0; border-color: var(--card-border); }
         </style>
         """,
         unsafe_allow_html=True,
@@ -658,15 +740,16 @@ def render_main():
         for col, category in zip(cols, row):
             with col:
                 icon = CATEGORY_ICONS.get(category, "")
+                slug = CATEGORY_SLUG.get(category, category)
                 current = my_counts.get(category, 0)
                 if st.button(
                     f"{icon} {category}\n＋1（現在 {current}）",
-                    key=f"plus_{category}", type="primary", use_container_width=True,
+                    key=f"plus_{slug}", type="primary", use_container_width=True,
                 ):
                     record_event(event_key, venue, staff, category, +1)
                     st.rerun()
                 if st.button(
-                    "−1 修正", key=f"minus_{category}",
+                    "−1 修正", key=f"minus_{slug}",
                     type="secondary", use_container_width=True,
                 ):
                     if current > 0:
