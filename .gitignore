@@ -1,0 +1,10 @@
+# 機密情報（絶対にコミットしない）
+.streamlit/secrets.toml
+
+# ローカルDB・生成物
+event_sales.db
+event_sales.db-wal
+event_sales.db-shm
+__pycache__/
+*.pyc
+st.log
