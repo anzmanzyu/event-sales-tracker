@@ -26,7 +26,7 @@
 import os
 import sqlite3
 from contextlib import closing
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
 import streamlit as st
 import streamlit.components.v1 as components
@@ -129,9 +129,11 @@ class SQLiteBackend:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS venues (
-                    venue      TEXT PRIMARY KEY,
-                    target     INTEGER NOT NULL DEFAULT 0,
-                    updated_at TEXT NOT NULL
+                    venue        TEXT PRIMARY KEY,
+                    target       INTEGER NOT NULL DEFAULT 0,
+                    period_start TEXT,
+                    period_end   TEXT,
+                    updated_at   TEXT NOT NULL
                 )
                 """
             )
@@ -149,25 +151,30 @@ class SQLiteBackend:
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_venue ON events(venue)")
 
-    def set_target(self, venue: str, target: int):
+    def set_venue(self, venue: str, target: int, period_start: str, period_end: str):
         with closing(self._conn()) as conn, conn:
             conn.execute(
                 """
-                INSERT INTO venues (venue, target, updated_at)
-                VALUES (?, ?, ?)
+                INSERT INTO venues (venue, target, period_start, period_end, updated_at)
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(venue) DO UPDATE SET
                     target = excluded.target,
+                    period_start = excluded.period_start,
+                    period_end = excluded.period_end,
                     updated_at = excluded.updated_at
                 """,
-                (venue, int(target), _now_local_iso()),
+                (venue, int(target), period_start, period_end, _now_local_iso()),
             )
 
-    def get_target(self, venue: str) -> int:
+    def get_venue_meta(self, venue: str):
         with closing(self._conn()) as conn:
             row = conn.execute(
-                "SELECT target FROM venues WHERE venue = ?", (venue,)
+                "SELECT target, period_start, period_end FROM venues WHERE venue = ?",
+                (venue,),
             ).fetchone()
-        return int(row[0]) if row else 0
+        if not row:
+            return None
+        return {"target": int(row[0]), "period_start": row[1], "period_end": row[2]}
 
     def record_event(self, venue: str, staff: str, category: str, delta: int):
         with closing(self._conn()) as conn, conn:
@@ -224,22 +231,33 @@ class SupabaseBackend:
 
         self.client = create_client(url, key)
 
-    def set_target(self, venue: str, target: int):
+    def set_venue(self, venue: str, target: int, period_start: str, period_end: str):
         self.client.table("venues").upsert(
-            {"venue": venue, "target": int(target), "updated_at": _now_utc_iso()}
+            {
+                "venue": venue,
+                "target": int(target),
+                "period_start": period_start,
+                "period_end": period_end,
+                "updated_at": _now_utc_iso(),
+            }
         ).execute()
 
-    def get_target(self, venue: str) -> int:
+    def get_venue_meta(self, venue: str):
         res = (
             self.client.table("venues")
-            .select("target")
+            .select("target,period_start,period_end")
             .eq("venue", venue)
             .limit(1)
             .execute()
         )
         if res.data:
-            return int(res.data[0]["target"])
-        return 0
+            r = res.data[0]
+            return {
+                "target": int(r["target"]),
+                "period_start": r.get("period_start"),
+                "period_end": r.get("period_end"),
+            }
+        return None
 
     def record_event(self, venue: str, staff: str, category: str, delta: int):
         self.client.table("events").insert(
@@ -332,12 +350,12 @@ def init_db():
     get_backend()  # 生成時にテーブル自動作成（SQLite）
 
 
-def set_target(venue: str, target: int):
-    get_backend().set_target(venue, int(target))
+def set_venue(venue: str, target: int, period_start: str, period_end: str):
+    get_backend().set_venue(venue, int(target), period_start, period_end)
 
 
-def get_target(venue: str) -> int:
-    return get_backend().get_target(venue)
+def get_venue_meta(venue: str):
+    return get_backend().get_venue_meta(venue)
 
 
 def record_event(venue: str, staff: str, category: str, delta: int):
@@ -397,7 +415,17 @@ def _notion_headers():
     }
 
 
-def _notion_props(venue: str, totals: dict, total_all: int, staff_count: int, key: str) -> dict:
+def _notion_date(period_start: str, period_end: str) -> dict:
+    """開始〜終了をNotionの日付プロパティ形式に変換する（単日なら開始のみ）。"""
+    if not period_start:
+        return {"date": None}
+    d = {"start": period_start}
+    if period_end and period_end != period_start:
+        d["end"] = period_end
+    return {"date": d}
+
+
+def _notion_props(venue, totals, total_all, staff_count, key, target, period_start, period_end) -> dict:
     """会場合計をNotionのプロパティ形式に変換する。"""
     def num(v):
         return {"number": int(v)}
@@ -408,6 +436,8 @@ def _notion_props(venue: str, totals: dict, total_all: int, staff_count: int, ke
     return {
         "会場": {"title": [{"text": {"content": venue}}]},
         "担当者": txt(f"{staff_count}名"),  # 会場に立っているスタッフ人数
+        "イベント期間": _notion_date(period_start, period_end),
+        "期間目標値": num(target),  # 新規＋MNPの期間目標
         "機種変更": num(totals["機種変更"]),
         "MNP": num(totals["MNP"]),
         "新規契約": num(totals["新規契約"]),
@@ -446,6 +476,11 @@ def sync_breakdown_to_notion(venue: str) -> int:
     staff_count = len(breakdown)
     key = venue  # 会場名そのものを一意キーに
 
+    meta = get_venue_meta(venue) or {}
+    target = meta.get("target", 0) or 0
+    period_start = meta.get("period_start")
+    period_end = meta.get("period_end")
+
     # 既存ページ検索（_key＝会場名で一意化）
     query = requests.post(
         f"{NOTION_API}/databases/{db_id}/query",
@@ -455,7 +490,9 @@ def sync_breakdown_to_notion(venue: str) -> int:
     )
     query.raise_for_status()
     results = query.json().get("results", [])
-    props = _notion_props(venue, totals, total_all, staff_count, key)
+    props = _notion_props(
+        venue, totals, total_all, staff_count, key, target, period_start, period_end
+    )
 
     if results:  # 更新
         page_id = results[0]["id"]
@@ -574,27 +611,48 @@ def render_setup():
 
     staff = st.text_input("担当者名（あなたの名前）", placeholder="例：並木")
 
-    # 既存会場を選んだ場合はその目標を初期値に（誤って目標を上書きしないため）
-    default_target = 30
+    # 既存会場を選んだ場合は、その目標・期間を初期値に（誤って上書きしないため）
+    today = date.today()
+    default_target, default_start, default_end = 30, today, today
     if venue and venue in existing:
-        default_target = get_target(venue) or 30
+        meta = get_venue_meta(venue)
+        if meta:
+            default_target = meta["target"] or 30
+            if meta.get("period_start"):
+                try:
+                    default_start = date.fromisoformat(meta["period_start"])
+                except ValueError:
+                    pass
+            if meta.get("period_end"):
+                try:
+                    default_end = date.fromisoformat(meta["period_end"])
+                except ValueError:
+                    pass
+
+    c1, c2 = st.columns(2)
+    period_start = c1.date_input("イベント開始日", value=default_start, format="YYYY/MM/DD")
+    period_end = c2.date_input("イベント終了日", value=default_end, format="YYYY/MM/DD")
+
     target = st.number_input(
-        "会場全体の今日の目標件数（全商材の合算）",
+        "期間目標値（新規＋MNPの合計目標件数）",
         min_value=1,
         max_value=100000,
         value=int(default_target),
         step=1,
-        help="同じ会場のスタッフで共有される目標です。あとから変更もできます。",
+        help="この派遣期間トータルの「新規＋MNP」の目標件数です。会場のスタッフで共有され、あとから変更もできます。",
     )
 
     if st.button("この会場で開始する", type="primary", use_container_width=True):
         if not venue or not venue.strip() or not staff.strip():
             st.error("会場名と担当者名を入力してください。")
             return
+        if period_end < period_start:
+            st.error("終了日は開始日以降にしてください。")
+            return
 
         venue = venue.strip()
         staff = staff.strip()
-        set_target(venue, int(target))
+        set_venue(venue, int(target), period_start.isoformat(), period_end.isoformat())
 
         st.session_state["venue"] = venue
         st.session_state["staff"] = staff
@@ -612,32 +670,48 @@ def render_main():
 
     do_autorefresh(AUTO_REFRESH_MS, key="dashboard_refresh")
 
+    meta = get_venue_meta(venue) or {}
+    target = meta.get("target", 0) or 0
+    period_start = meta.get("period_start")
+    period_end = meta.get("period_end")
+    period_label = ""
+    if period_start:
+        period_label = period_start.replace("-", "/")
+        if period_end and period_end != period_start:
+            period_label += "〜" + period_end.replace("-", "/")
+
     # ===== ヘッダー =====
     top_l, top_r = st.columns([3, 1])
     with top_l:
         st.subheader(f"🏬 {venue}")
-        st.caption(f"担当：{staff}　｜　{AUTO_REFRESH_MS // 1000}秒ごとに自動更新")
+        cap = f"担当：{staff}"
+        if period_label:
+            cap += f"　｜　📅 {period_label}"
+        cap += f"　｜　{AUTO_REFRESH_MS // 1000}秒ごとに自動更新"
+        st.caption(cap)
     with top_r:
         if st.button("設定変更", use_container_width=True):
             st.session_state["configured"] = False
             st.rerun()
 
-    # ===== リアルタイムダッシュボード =====
-    target = get_target(venue)
-    total = get_venue_total(venue)
-    rate = (total / target * 100) if target > 0 else 0.0
-    remaining = max(target - total, 0)
+    # ===== リアルタイムダッシュボード（新規＋MNP を目標に）=====
+    breakdown = get_breakdown(venue)
+    nm_total = sum(r["MNP"] + r["新規契約"] for r in breakdown)  # 新規＋MNP
+    all_total = get_venue_total(venue)  # 全商材合計（参考）
+    rate = (nm_total / target * 100) if target > 0 else 0.0
+    remaining = max(target - nm_total, 0)
 
-    st.markdown("### 📊 会場全体の進捗")
+    st.markdown("### 📊 会場全体の進捗（新規＋MNP）")
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("獲得総数", f"{total} 件")
-    m2.metric("目標", f"{target} 件")
+    m1.metric("新規＋MNP", f"{nm_total} 件")
+    m2.metric("期間目標", f"{target} 件")
     m3.metric("達成率", f"{rate:.0f}%")
     m4.metric("残り", f"{remaining} 件")
 
-    st.progress(min(total / target, 1.0) if target > 0 else 0.0)
-    if target > 0 and total >= target:
-        st.success("🎉 目標達成！ナイスファイト！")
+    st.progress(min(nm_total / target, 1.0) if target > 0 else 0.0)
+    st.caption(f"※全商材合計（機種変更・LTV含む）：{all_total} 件")
+    if target > 0 and nm_total >= target:
+        st.success("🎉 期間目標達成！ナイスファイト！")
 
     st.divider()
 
