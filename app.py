@@ -202,6 +202,13 @@ class SQLiteBackend:
     def get_breakdown(self, venue: str) -> list:
         return _aggregate_breakdown(self._venue_events(venue))
 
+    def get_venues(self) -> list:
+        with closing(self._conn()) as conn:
+            rows = conn.execute(
+                "SELECT venue FROM venues ORDER BY venue"
+            ).fetchall()
+        return [r[0] for r in rows]
+
 
 class SupabaseBackend:
     """本番用。Supabase(Postgres)を共有DBとして使う。
@@ -268,6 +275,10 @@ class SupabaseBackend:
 
     def get_breakdown(self, venue: str) -> list:
         return _aggregate_breakdown(self._venue_events(venue))
+
+    def get_venues(self) -> list:
+        res = self.client.table("venues").select("venue").order("venue").execute()
+        return [r["venue"] for r in (res.data or [])]
 
 
 def _aggregate_breakdown(rows) -> list:
@@ -347,6 +358,10 @@ def get_breakdown(venue: str) -> list:
     return get_backend().get_breakdown(venue)
 
 
+def get_venues() -> list:
+    return get_backend().get_venues()
+
+
 # ===========================================================================
 # Notion同期（管理者ダッシュボード向け）
 #   設計方針:
@@ -382,8 +397,8 @@ def _notion_headers():
     }
 
 
-def _notion_props(venue: str, row: dict, key: str) -> dict:
-    """内訳1行をNotionのプロパティ形式に変換する。"""
+def _notion_props(venue: str, totals: dict, total_all: int, staff_count: int, key: str) -> dict:
+    """会場合計をNotionのプロパティ形式に変換する。"""
     def num(v):
         return {"number": int(v)}
 
@@ -392,22 +407,22 @@ def _notion_props(venue: str, row: dict, key: str) -> dict:
 
     return {
         "会場": {"title": [{"text": {"content": venue}}]},
-        "担当者": txt(row["担当者"]),
-        "機種変更": num(row["機種変更"]),
-        "MNP": num(row["MNP"]),
-        "新規契約": num(row["新規契約"]),
-        "LTV商材": num(row["LTV商材"]),
-        "合計": num(row["合計"]),
+        "担当者": txt(f"{staff_count}名"),  # 会場に立っているスタッフ人数
+        "機種変更": num(totals["機種変更"]),
+        "MNP": num(totals["MNP"]),
+        "新規契約": num(totals["新規契約"]),
+        "LTV商材": num(totals["LTV商材"]),
+        "合計": num(total_all),
         "更新時刻": txt(_now_local_iso()),
         "_key": txt(key),
     }
 
 
 def sync_breakdown_to_notion(venue: str) -> int:
-    """会場のスタッフ別内訳をNotionへ集約同期する。
+    """会場ごとに1行へ集約してNotionへ同期する（会場名＝一意キー）。
 
-    会場×スタッフごとに1ページを upsert（あれば更新・無ければ作成）。
-    戻り値: 同期した行数。未設定時は 0 を返す（no-op）。
+    全スタッフ分を会場単位で合算し、1ページに upsert（あれば更新・無ければ作成）。
+    戻り値: 同期した会場数（0 or 1）。未設定時は 0（no-op）。
     """
     if not notion_configured():
         print("[notion] 未設定のためスキップ（ローカル検証モード）")
@@ -419,40 +434,46 @@ def sync_breakdown_to_notion(venue: str) -> int:
     db_id = conf["database_id"]
     headers = _notion_headers()
     breakdown = get_breakdown(venue)
+    if not breakdown:
+        return 0
 
-    synced = 0
+    # 全スタッフ分を会場単位で合算
+    totals = {c: 0 for c in CATEGORIES}
     for row in breakdown:
-        key = f"{venue} / {row['担当者']}"
-        # 既存ページ検索（_key で一意化）
-        query = requests.post(
-            f"{NOTION_API}/databases/{db_id}/query",
+        for c in CATEGORIES:
+            totals[c] += row[c]
+    total_all = sum(totals.values())
+    staff_count = len(breakdown)
+    key = venue  # 会場名そのものを一意キーに
+
+    # 既存ページ検索（_key＝会場名で一意化）
+    query = requests.post(
+        f"{NOTION_API}/databases/{db_id}/query",
+        headers=headers,
+        json={"filter": {"property": "_key", "rich_text": {"equals": key}}},
+        timeout=15,
+    )
+    query.raise_for_status()
+    results = query.json().get("results", [])
+    props = _notion_props(venue, totals, total_all, staff_count, key)
+
+    if results:  # 更新
+        page_id = results[0]["id"]
+        resp = requests.patch(
+            f"{NOTION_API}/pages/{page_id}",
             headers=headers,
-            json={"filter": {"property": "_key", "rich_text": {"equals": key}}},
+            json={"properties": props},
             timeout=15,
         )
-        query.raise_for_status()
-        results = query.json().get("results", [])
-        props = _notion_props(venue, row, key)
-
-        if results:  # 更新
-            page_id = results[0]["id"]
-            resp = requests.patch(
-                f"{NOTION_API}/pages/{page_id}",
-                headers=headers,
-                json={"properties": props},
-                timeout=15,
-            )
-        else:  # 新規作成
-            resp = requests.post(
-                f"{NOTION_API}/pages",
-                headers=headers,
-                json={"parent": {"database_id": db_id}, "properties": props},
-                timeout=15,
-            )
-        resp.raise_for_status()
-        synced += 1
-
-    return synced
+    else:  # 新規作成
+        resp = requests.post(
+            f"{NOTION_API}/pages",
+            headers=headers,
+            json={"parent": {"database_id": db_id}, "properties": props},
+            timeout=15,
+        )
+    resp.raise_for_status()
+    return 1
 
 
 # ---------------------------------------------------------------------------
@@ -537,24 +558,37 @@ def render_setup():
         + ("　｜　☁ Supabase接続中" if mode == "supabase" else "　｜　💾 ローカル検証モード")
     )
 
-    with st.form("setup_form"):
-        st.subheader("セッションを開始")
-        venue = st.text_input("イベント会場名", placeholder="例：高松ゆめタウン特設ブース")
-        staff = st.text_input("担当者名（あなたの名前）", placeholder="例：並木")
-        target = st.number_input(
-            "会場全体の今日の目標件数（全商材の合算）",
-            min_value=1,
-            max_value=100000,
-            value=30,
-            step=1,
-            help="同じ会場のスタッフで共有される目標です。あとから変更もできます。",
-        )
-        submitted = st.form_submit_button(
-            "この会場で開始する", type="primary", use_container_width=True
-        )
+    st.subheader("セッションを開始")
 
-    if submitted:
-        if not venue.strip() or not staff.strip():
+    # 既存の会場があればプルダウンで選べる（表記ゆれ・入力ミスによる会場分裂を防ぐ）
+    existing = get_venues()
+    NEW_LABEL = "＋ 新しい会場を入力"
+    if existing:
+        choice = st.selectbox("イベント会場名", [NEW_LABEL] + existing)
+        if choice == NEW_LABEL:
+            venue = st.text_input("新しい会場名", placeholder="例：高松ゆめタウン特設ブース")
+        else:
+            venue = choice
+    else:
+        venue = st.text_input("イベント会場名", placeholder="例：高松ゆめタウン特設ブース")
+
+    staff = st.text_input("担当者名（あなたの名前）", placeholder="例：並木")
+
+    # 既存会場を選んだ場合はその目標を初期値に（誤って目標を上書きしないため）
+    default_target = 30
+    if venue and venue in existing:
+        default_target = get_target(venue) or 30
+    target = st.number_input(
+        "会場全体の今日の目標件数（全商材の合算）",
+        min_value=1,
+        max_value=100000,
+        value=int(default_target),
+        step=1,
+        help="同じ会場のスタッフで共有される目標です。あとから変更もできます。",
+    )
+
+    if st.button("この会場で開始する", type="primary", use_container_width=True):
+        if not venue or not venue.strip() or not staff.strip():
             st.error("会場名と担当者名を入力してください。")
             return
 
