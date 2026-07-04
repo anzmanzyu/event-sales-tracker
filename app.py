@@ -625,14 +625,16 @@ def inject_css():
 
         /* ＋1 の大ボタン（primary） */
         div.stButton > button[kind="primary"] {
-            height: 5.4rem; font-size: 1.95rem; font-weight: 800;
-            border-radius: 18px; width: 100%; color: #fff;
-            white-space: pre-line; line-height: 1.15;
+            min-height: 3.7rem; height: auto; padding: 0.5rem 0.6rem;
+            font-size: 2.2rem; font-weight: 800;
+            border-radius: 16px; width: 100%; color: #fff;
+            white-space: pre-line; line-height: 1.1;
             background: linear-gradient(180deg, #4F8DFD 0%, #3D6FE0 100%);
             box-shadow: 0 8px 20px rgba(79,141,253,0.28);
         }
-        /* 長い自由項目名がはみ出さないように少しだけ調整 */
-        div.stButton > button[kind="primary"] p { font-size: inherit; }
+        /* ボタン内テキスト（Streamlitは<p>で包む）を確実に大きく */
+        div.stButton > button[kind="primary"] p,
+        div.stButton > button[kind="primary"] div { font-size: 2.2rem !important; font-weight: 800 !important; }
         div.stButton > button[kind="primary"]:hover { filter: brightness(1.07); }
 
         /* −1 修正（secondary） */
