@@ -635,7 +635,7 @@ def inject_css():
         /* ★文字サイズはここだけ変える（枠は上で固定）★ */
         div.stButton > button[kind="primary"],
         div.stButton > button[kind="primary"] p,
-        div.stButton > button[kind="primary"] div { font-size: 1.7rem !important; font-weight: 800 !important; }
+        div.stButton > button[kind="primary"] div { font-size: 1.4rem !important; font-weight: 800 !important; }
         div.stButton > button[kind="primary"]:hover { filter: brightness(1.07); }
 
         /* −1 修正（secondary） */
