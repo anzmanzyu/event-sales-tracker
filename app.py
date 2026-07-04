@@ -450,10 +450,12 @@ def _notion_props(venue, totals, staff_count, target, period_start, period_end, 
     # 合計は固定KPI（MNP＋新規契約）のみ。自由項目は含めない
     kpi_total = sum(totals.get(c, 0) for c in FIXED_CATEGORIES)
 
+    month = (period_start or "")[:7]  # 'YYYY-MM'（月グループ化・フィルター用）
     return {
         "会場": {"title": [{"text": {"content": venue}}]},
         "担当者": txt(f"{staff_count}名"),
-        "イベント期間": _notion_date(period_start, period_end),
+        "イベント期間": txt(fmt_period(period_start, period_end)),  # 〇/〇〜〇/〇 表記
+        "月": txt(month),
         "期間目標値": num(target),
         "MNP": num(totals.get("MNP", 0)),
         "新規契約": num(totals.get("新規契約", 0)),
