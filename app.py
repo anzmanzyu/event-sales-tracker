@@ -31,10 +31,11 @@ import streamlit.components.v1 as components
 # 定数
 # ---------------------------------------------------------------------------
 
-CATEGORIES = ["機種変更", "MNP", "新規契約", "LTV商材"]
-CATEGORY_ICONS = {"機種変更": "📱", "MNP": "🔁", "新規契約": "✨", "LTV商材": "💡"}
-# CSSで色分けするためのASCIIスラッグ（.st-key-plus_<slug> で狙い撃ちできる）
-CATEGORY_SLUG = {"機種変更": "kishu", "MNP": "mnp", "新規契約": "shinki", "LTV商材": "ltv"}
+# 固定項目（KPI「新規＋MNP」の対象）。これ以外はすべて自由項目。
+FIXED_CATEGORIES = ["MNP", "新規契約"]
+FIXED_ICONS = {"MNP": "🔁", "新規契約": "✨"}
+FIXED_SLUG = {"MNP": "mnp", "新規契約": "shinki"}
+CUSTOM_ICON = "🏷"
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "event_sales.db")
 AUTO_REFRESH_MS = 5000
@@ -204,11 +205,23 @@ class SQLiteBackend:
         return sum(r[2] for r in self._event_rows(event_key))
 
     def get_my_counts(self, event_key, staff):
-        counts = {c: 0 for c in CATEGORIES}
+        counts = {}
         for _s, category, delta in self._event_rows(event_key, staff):
-            if category in counts:
-                counts[category] += int(delta)
+            counts[category] = counts.get(category, 0) + int(delta)
         return counts
+
+    def get_category_totals(self, event_key):
+        totals = {}
+        for _s, category, delta in self._event_rows(event_key):
+            totals[category] = totals.get(category, 0) + int(delta)
+        return totals
+
+    def list_venue_categories(self, venue):
+        with closing(self._conn()) as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT category FROM events WHERE venue = ?", (venue,)
+            ).fetchall()
+        return [r[0] for r in rows]
 
     def get_breakdown(self, event_key):
         return _aggregate_breakdown(self._event_rows(event_key))
@@ -292,24 +305,35 @@ class SupabaseBackend:
         return sum(r[2] for r in self._event_rows(event_key))
 
     def get_my_counts(self, event_key, staff):
-        counts = {c: 0 for c in CATEGORIES}
+        counts = {}
         for _s, category, delta in self._event_rows(event_key, staff):
-            if category in counts:
-                counts[category] += int(delta)
+            counts[category] = counts.get(category, 0) + int(delta)
         return counts
+
+    def get_category_totals(self, event_key):
+        totals = {}
+        for _s, category, delta in self._event_rows(event_key):
+            totals[category] = totals.get(category, 0) + int(delta)
+        return totals
+
+    def list_venue_categories(self, venue):
+        res = self.client.table("events").select("category").eq("venue", venue).execute()
+        seen = []
+        for r in (res.data or []):
+            if r["category"] not in seen:
+                seen.append(r["category"])
+        return seen
 
     def get_breakdown(self, event_key):
         return _aggregate_breakdown(self._event_rows(event_key))
 
 
 def _aggregate_breakdown(rows) -> list:
-    """(staff, category, delta) をスタッフ別内訳に集約（合計降順）。"""
+    """(staff, category, delta) をスタッフ別内訳に集約（任意カテゴリ対応・合計降順）。"""
     table = {}
     for staff, category, delta in rows:
-        if staff not in table:
-            table[staff] = {c: 0 for c in CATEGORIES}
-        if category in table[staff]:
-            table[staff][category] += int(delta)
+        table.setdefault(staff, {})
+        table[staff][category] = table[staff].get(category, 0) + int(delta)
     result = []
     for staff, counts in table.items():
         row = {"担当者": staff}
@@ -369,6 +393,14 @@ def get_my_counts(event_key, staff):
     return get_backend().get_my_counts(event_key, staff)
 
 
+def get_category_totals(event_key):
+    return get_backend().get_category_totals(event_key)
+
+
+def list_venue_categories(venue):
+    return get_backend().list_venue_categories(venue)
+
+
 def get_breakdown(event_key):
     return get_backend().get_breakdown(event_key)
 
@@ -412,15 +444,18 @@ def _notion_props(venue, totals, total_all, staff_count, target, period_start, p
     def txt(v):
         return {"rich_text": [{"text": {"content": str(v)}}]}
 
+    # 固定以外（自由項目）を「機種変更×5, クレカ×3」形式の内訳テキストに集約
+    customs = {c: v for c, v in totals.items() if c not in FIXED_CATEGORIES and v}
+    naiyaku = ", ".join(f"{c}×{v}" for c, v in sorted(customs.items(), key=lambda x: -x[1]))
+
     return {
         "会場": {"title": [{"text": {"content": venue}}]},
         "担当者": txt(f"{staff_count}名"),
         "イベント期間": _notion_date(period_start, period_end),
         "期間目標値": num(target),
-        "機種変更": num(totals["機種変更"]),
-        "MNP": num(totals["MNP"]),
-        "新規契約": num(totals["新規契約"]),
-        "LTV商材": num(totals["LTV商材"]),
+        "MNP": num(totals.get("MNP", 0)),
+        "新規契約": num(totals.get("新規契約", 0)),
+        "内訳": txt(naiyaku),
         "合計": num(total_all),
         "更新時刻": txt(_now_local_iso()),
         "_key": txt(event_key),  # 会場×期間の一意キー（非表示推奨）
@@ -442,14 +477,10 @@ def sync_event_to_notion(event_key: str) -> int:
     meta = get_event_meta(event_key)
     if not meta:
         return 0
-    breakdown = get_breakdown(event_key)
 
-    totals = {c: 0 for c in CATEGORIES}
-    for row in breakdown:
-        for c in CATEGORIES:
-            totals[c] += row[c]
+    totals = get_category_totals(event_key)
     total_all = sum(totals.values())
-    staff_count = len(breakdown)
+    staff_count = len(get_breakdown(event_key))
 
     props = _notion_props(
         meta["venue"], totals, total_all, staff_count,
@@ -576,11 +607,10 @@ def inject_css():
         }
         div.stButton > button[kind="secondary"]:hover { color: #fff; background: rgba(255,255,255,0.09); }
 
-        /* 4商材ボタンを色分け（keyのst-key-クラスで狙い撃ち・!importantで確実に上書き） */
-        .st-key-plus_kishu  button[kind="primary"] { background: linear-gradient(180deg,#3B82F6,#2E6AD6) !important; box-shadow:0 8px 20px rgba(59,130,246,0.30) !important; }
+        /* ボタン色分け：固定=MNP紫/新規緑、自由項目=アンバー（keyのst-key-で狙い撃ち） */
         .st-key-plus_mnp    button[kind="primary"] { background: linear-gradient(180deg,#8B5CF6,#7248D9) !important; box-shadow:0 8px 20px rgba(139,92,246,0.30) !important; }
         .st-key-plus_shinki button[kind="primary"] { background: linear-gradient(180deg,#10B981,#0C9A6C) !important; box-shadow:0 8px 20px rgba(16,185,129,0.30) !important; }
-        .st-key-plus_ltv    button[kind="primary"] { background: linear-gradient(180deg,#F59E0B,#D9860A) !important; box-shadow:0 8px 20px rgba(245,158,11,0.30) !important; }
+        [class*="st-key-plus_c"] button[kind="primary"] { background: linear-gradient(180deg,#F59E0B,#D9860A) !important; box-shadow:0 8px 20px rgba(245,158,11,0.28) !important; }
 
         /* 入力・セレクト・expander */
         [data-testid="stExpander"] { border: 1px solid var(--card-border); border-radius: 14px; background: var(--card); }
@@ -707,8 +737,9 @@ def render_main():
 
     # ===== ダッシュボード（新規＋MNP を目標に）=====
     breakdown = get_breakdown(event_key)
-    nm_total = sum(r["MNP"] + r["新規契約"] for r in breakdown)
-    all_total = get_total(event_key)
+    totals = get_category_totals(event_key)
+    nm_total = sum(totals.get(c, 0) for c in FIXED_CATEGORIES)  # 新規＋MNP
+    all_total = sum(totals.values())
     rate = (nm_total / target * 100) if target > 0 else 0.0
     remaining = max(target - nm_total, 0)
 
@@ -720,7 +751,7 @@ def render_main():
     m4.metric("残り", f"{remaining} 件")
 
     st.progress(min(nm_total / target, 1.0) if target > 0 else 0.0)
-    st.caption(f"※全商材合計（機種変更・LTV含む）：{all_total} 件")
+    st.caption(f"※全項目合計（自由項目含む）：{all_total} 件")
     if target > 0 and nm_total >= target:
         st.success("🎉 期間目標達成！ナイスファイト！")
 
@@ -730,13 +761,31 @@ def render_main():
     st.markdown(f"### ➕ 実績を入力（{staff} さん）")
     my_counts = get_my_counts(event_key, staff)
 
-    grid = [CATEGORIES[i:i + 2] for i in range(0, len(CATEGORIES), 2)]
+    # 表示する項目 = 固定(MNP/新規) ＋ この会場で過去に使われた自由項目 ＋ 今セッションで追加した項目
+    venue_cats = [c for c in list_venue_categories(venue) if c not in FIXED_CATEGORIES]
+    session_new = st.session_state.get("new_items", [])
+    custom_items = []
+    for c in venue_cats + session_new:
+        if c not in custom_items:
+            custom_items.append(c)
+    items = FIXED_CATEGORIES + custom_items
+
+    # ボタンkey用のスラッグ（固定は専用色、自由項目は plus_c<n> で共通アンバー）
+    key_map, ci = {}, 0
+    for c in items:
+        if c in FIXED_SLUG:
+            key_map[c] = FIXED_SLUG[c]
+        else:
+            key_map[c] = f"c{ci}"
+            ci += 1
+
+    grid = [items[i:i + 2] for i in range(0, len(items), 2)]
     for row in grid:
         cols = st.columns(len(row))
         for col, category in zip(cols, row):
             with col:
-                icon = CATEGORY_ICONS.get(category, "")
-                slug = CATEGORY_SLUG.get(category, category)
+                icon = FIXED_ICONS.get(category, CUSTOM_ICON)
+                slug = key_map[category]
                 current = my_counts.get(category, 0)
                 if st.button(
                     f"{icon} {category}\n＋1（現在 {current}）",
@@ -753,6 +802,21 @@ def render_main():
                     st.rerun()
 
     st.caption(f"あなたの合計：{sum(my_counts.values())} 件")
+
+    # ===== 自由項目の追加 =====
+    with st.expander("＋ 項目を追加（自由入力）"):
+        st.caption("MNP・新規契約以外の項目を追加できます（例：機種変更、クレカ、でんき）。同じ会場で追加した項目は次回から自動で表示されます。")
+        new_name = st.text_input("項目名", key="new_item_input", placeholder="例：クレカ")
+        if st.button("この項目を追加する"):
+            name = (new_name or "").strip()
+            if not name:
+                st.error("項目名を入力してください。")
+            elif name in items or name == "合計" or name == "担当者":
+                st.warning("その項目はすでに使われています。")
+            else:
+                st.session_state.setdefault("new_items", []).append(name)
+                st.rerun()
+
     st.divider()
 
     # ===== スタッフ別の内訳 =====
@@ -761,9 +825,15 @@ def render_main():
         st.info("まだ実績がありません。最初の1件を入力してみましょう。")
     else:
         import pandas as pd
-        df = pd.DataFrame(breakdown)
-        col_order = ["担当者"] + CATEGORIES + ["合計"]
+        df = pd.DataFrame(breakdown).fillna(0)
+        for c in items:  # 未入力の項目も列として0で表示
+            if c not in df.columns:
+                df[c] = 0
+        col_order = ["担当者"] + items + ["合計"]
         df = df[[c for c in col_order if c in df.columns]]
+        for c in items + ["合計"]:
+            if c in df.columns:
+                df[c] = df[c].astype(int)
         st.dataframe(df, use_container_width=True, hide_index=True)
 
     # ===== 管理者用：Notion同期 =====
