@@ -24,8 +24,14 @@ import sqlite3
 from contextlib import closing
 from datetime import date, datetime, timezone
 
-import streamlit as st
-import streamlit.components.v1 as components
+# Streamlitはアプリ実行時のみ必要。Notion自動同期スクリプト（CI）では未使用なので
+# import できなくても動くようにガードする。
+try:
+    import streamlit as st
+    import streamlit.components.v1 as components
+except ImportError:  # pragma: no cover
+    st = None
+    components = None
 
 # ---------------------------------------------------------------------------
 # 定数
@@ -36,6 +42,12 @@ FIXED_CATEGORIES = ["MNP", "新規契約"]
 FIXED_ICONS = {"MNP": "🔁", "新規契約": "✨"}
 FIXED_SLUG = {"MNP": "mnp", "新規契約": "shinki"}
 CUSTOM_ICON = "🏷"
+# 自由項目ボタンの色（項目ごとに巡回して色分け）
+CUSTOM_PALETTE = [
+    ("#F59E0B", "#D9860A"), ("#06B6D4", "#0894AE"), ("#EC4899", "#C93080"),
+    ("#14B8A6", "#0F9488"), ("#F97316", "#D75E0C"), ("#A855F7", "#8B39D4"),
+    ("#84CC16", "#69A310"),
+]
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "event_sales.db")
 AUTO_REFRESH_MS = 5000
@@ -223,6 +235,13 @@ class SQLiteBackend:
             ).fetchall()
         return [r[0] for r in rows]
 
+    def list_venue_staff(self, venue):
+        with closing(self._conn()) as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT staff FROM events WHERE venue = ?", (venue,)
+            ).fetchall()
+        return [r[0] for r in rows]
+
     def get_breakdown(self, event_key):
         return _aggregate_breakdown(self._event_rows(event_key))
 
@@ -324,6 +343,14 @@ class SupabaseBackend:
                 seen.append(r["category"])
         return seen
 
+    def list_venue_staff(self, venue):
+        res = self.client.table("events").select("staff").eq("venue", venue).execute()
+        seen = []
+        for r in (res.data or []):
+            if r["staff"] not in seen:
+                seen.append(r["staff"])
+        return seen
+
     def get_breakdown(self, event_key):
         return _aggregate_breakdown(self._event_rows(event_key))
 
@@ -399,6 +426,10 @@ def get_category_totals(event_key):
 
 def list_venue_categories(venue):
     return get_backend().list_venue_categories(venue)
+
+
+def list_venue_staff(venue):
+    return get_backend().list_venue_staff(venue)
 
 
 def get_breakdown(event_key):
@@ -594,9 +625,9 @@ def inject_css():
 
         /* ＋1 の大ボタン（primary） */
         div.stButton > button[kind="primary"] {
-            height: 5.4rem; font-size: 1.3rem; font-weight: 800;
+            height: 5.4rem; font-size: 1.55rem; font-weight: 800;
             border-radius: 18px; width: 100%; color: #fff;
-            white-space: pre-line; line-height: 1.25;
+            white-space: pre-line; line-height: 1.2;
             background: linear-gradient(180deg, #4F8DFD 0%, #3D6FE0 100%);
             box-shadow: 0 8px 20px rgba(79,141,253,0.28);
         }
@@ -613,12 +644,20 @@ def inject_css():
         /* ボタン色分け：固定=MNP紫/新規緑、自由項目=アンバー（keyのst-key-で狙い撃ち） */
         .st-key-plus_mnp    button[kind="primary"] { background: linear-gradient(180deg,#8B5CF6,#7248D9) !important; box-shadow:0 8px 20px rgba(139,92,246,0.30) !important; }
         .st-key-plus_shinki button[kind="primary"] { background: linear-gradient(180deg,#10B981,#0C9A6C) !important; box-shadow:0 8px 20px rgba(16,185,129,0.30) !important; }
-        [class*="st-key-plus_c"] button[kind="primary"] { background: linear-gradient(180deg,#F59E0B,#D9860A) !important; box-shadow:0 8px 20px rgba(245,158,11,0.28) !important; }
+        /* 自由項目ボタンの色は render_main で項目ごとに動的注入（plus_c0, plus_c1...） */
 
         /* ボタン下の獲得数表示（自分／会場） */
         .catcnt { text-align:center; font-size:0.85rem; color:var(--muted); margin:4px 0 2px; }
         .catcnt b { font-size:1.35rem; color:#fff; font-weight:800; margin:0 3px; }
         .catcnt .sep { opacity:0.4; margin:0 6px; }
+
+        /* スタッフ別ランキング */
+        .rankrow { display:flex; align-items:center; gap:10px; padding:10px 12px; margin-bottom:6px;
+            background:var(--card); border:1px solid var(--card-border); border-radius:12px; }
+        .rankrow .rk { font-size:1.15rem; min-width:2.4rem; text-align:center; }
+        .rankrow .rn { font-weight:700; flex:1; }
+        .rankrow .rv { color:var(--muted); font-size:0.85rem; white-space:nowrap; }
+        .rankrow .rv b { color:#22C55E; font-size:1.2rem; margin:0 2px; }
 
         /* 入力・セレクト・expander */
         [data-testid="stExpander"] { border: 1px solid var(--card-border); border-radius: 14px; background: var(--card); }
@@ -691,7 +730,14 @@ def render_setup():
             f"\n\n期間目標値（新規＋MNP）：{target} 件"
         )
 
-    staff = st.text_input("担当者名（あなたの名前）", placeholder="例：並木")
+    # 担当者名：その会場で過去に入力があればプルダウン（表記ゆれ防止）
+    existing_staff = list_venue_staff(venue) if venue and venue.strip() else []
+    if existing_staff:
+        NEW_STAFF = "＋ 新しい担当者"
+        s_choice = st.selectbox("担当者名（あなたの名前）", [NEW_STAFF] + existing_staff)
+        staff = st.text_input("新しい担当者名", placeholder="例：並木") if s_choice == NEW_STAFF else s_choice
+    else:
+        staff = st.text_input("担当者名（あなたの名前）", placeholder="例：並木")
 
     if st.button("このイベントで開始する", type="primary", use_container_width=True):
         if not venue or not venue.strip() or not staff.strip():
@@ -723,7 +769,9 @@ def render_main():
     venue = st.session_state["venue"]
     staff = st.session_state["staff"]
 
-    do_autorefresh(AUTO_REFRESH_MS, key="dashboard_refresh")
+    adding = st.session_state.get("adding_item", False)
+    if not adding:  # 項目追加中は自動更新を止める（入力中のフォーカス喪失を防止）
+        do_autorefresh(AUTO_REFRESH_MS, key="dashboard_refresh")
 
     meta = get_event_meta(event_key) or {}
     target = meta.get("target", 0) or 0
@@ -752,11 +800,12 @@ def render_main():
     remaining = max(target - nm_total, 0)
 
     st.markdown("### 📊 会場全体の進捗（新規＋MNP）")
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("新規＋MNP", f"{nm_total} 件")
-    m2.metric("期間目標", f"{target} 件")
-    m3.metric("達成率", f"{rate:.0f}%")
-    m4.metric("残り", f"{remaining} 件")
+    r1 = st.columns(2)
+    r1[0].metric("新規＋MNP", f"{nm_total} 件")
+    r1[1].metric("期間目標", f"{target} 件")
+    r2 = st.columns(2)
+    r2[0].metric("達成率", f"{rate:.0f}%")
+    r2[1].metric("残り", f"{remaining} 件")
 
     st.progress(min(nm_total / target, 1.0) if target > 0 else 0.0)
     st.caption(f"※全項目合計（自由項目含む）：{all_total} 件")
@@ -778,7 +827,7 @@ def render_main():
             custom_items.append(c)
     items = FIXED_CATEGORIES + custom_items
 
-    # ボタンkey用のスラッグ（固定は専用色、自由項目は plus_c<n> で共通アンバー）
+    # ボタンkey用のスラッグ（固定は専用色、自由項目は plus_c<n> で色を巡回）
     key_map, ci = {}, 0
     for c in items:
         if c in FIXED_SLUG:
@@ -786,6 +835,18 @@ def render_main():
         else:
             key_map[c] = f"c{ci}"
             ci += 1
+
+    # 自由項目ボタンを項目ごとに色分け（動的CSS注入）
+    if custom_items:
+        rules = ""
+        for i in range(len(custom_items)):
+            a, b = CUSTOM_PALETTE[i % len(CUSTOM_PALETTE)]
+            rules += (
+                f'.st-key-plus_c{i} button[kind="primary"]{{'
+                f'background:linear-gradient(180deg,{a},{b})!important;'
+                f'box-shadow:0 8px 20px {a}55!important;}}'
+            )
+        st.markdown(f"<style>{rules}</style>", unsafe_allow_html=True)
 
     st.caption("ボタンをタップで ＋1／下の「−1 修正」で取り消し。数字は「自分／会場全体」")
     grid = [items[i:i + 2] for i in range(0, len(items), 2)]
@@ -817,38 +878,63 @@ def render_main():
 
     st.caption(f"あなたの合計：{sum(my_counts.values())} 件")
 
-    # ===== 自由項目の追加 =====
-    with st.expander("＋ 項目を追加（自由入力）"):
-        st.caption("MNP・新規契約以外の項目を追加できます（例：機種変更、クレカ、でんき）。同じ会場で追加した項目は次回から自動で表示されます。")
+    # ===== 自由項目の追加（追加中は自動更新を停止）=====
+    if not adding:
+        if st.button("＋ 項目を追加（自由入力）"):
+            st.session_state["adding_item"] = True
+            st.rerun()
+    else:
+        st.markdown("**＋ 項目を追加**")
+        st.caption("MNP・新規契約以外の項目を追加できます（例：機種変更、クレカ、でんき）。同じ会場で追加した項目は次回から自動表示。追加中は自動更新を止めています。")
         new_name = st.text_input("項目名", key="new_item_input", placeholder="例：クレカ")
-        if st.button("この項目を追加する"):
+        a1, a2 = st.columns(2)
+        if a1.button("追加する", type="primary", use_container_width=True):
             name = (new_name or "").strip()
             if not name:
                 st.error("項目名を入力してください。")
-            elif name in items or name == "合計" or name == "担当者":
+            elif name in items or name in ("合計", "担当者"):
                 st.warning("その項目はすでに使われています。")
             else:
                 st.session_state.setdefault("new_items", []).append(name)
+                st.session_state["adding_item"] = False
                 st.rerun()
+        if a2.button("キャンセル", use_container_width=True):
+            st.session_state["adding_item"] = False
+            st.rerun()
 
     st.divider()
 
-    # ===== スタッフ別の内訳 =====
-    st.markdown("### 👥 スタッフ別の内訳")
+    # ===== スタッフ別ランキング（新規＋MNP）=====
+    st.markdown("### 🏆 スタッフ別ランキング（新規＋MNP）")
     if not breakdown:
         st.info("まだ実績がありません。最初の1件を入力してみましょう。")
     else:
-        import pandas as pd
-        df = pd.DataFrame(breakdown).fillna(0)
-        for c in items:  # 未入力の項目も列として0で表示
-            if c not in df.columns:
-                df[c] = 0
-        col_order = ["担当者"] + items + ["合計"]
-        df = df[[c for c in col_order if c in df.columns]]
-        for c in items + ["合計"]:
-            if c in df.columns:
-                df[c] = df[c].astype(int)
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        ranked = []
+        for r in breakdown:
+            nm = r.get("MNP", 0) + r.get("新規契約", 0)
+            ranked.append((r["担当者"], nm, r["合計"]))
+        ranked.sort(key=lambda x: (-x[1], -x[2]))
+        medals = ["🥇", "🥈", "🥉"]
+        for idx, (name, nm, tot) in enumerate(ranked):
+            badge = medals[idx] if idx < 3 else f"{idx + 1}位"
+            st.markdown(
+                f"<div class='rankrow'><span class='rk'>{badge}</span>"
+                f"<span class='rn'>{name}</span>"
+                f"<span class='rv'>新規＋MNP <b>{nm}</b> ／ 全{tot}件</span></div>",
+                unsafe_allow_html=True,
+            )
+        with st.expander("📋 項目別の内訳を見る"):
+            import pandas as pd
+            df = pd.DataFrame(breakdown).fillna(0)
+            for c in items:  # 未入力の項目も列として0で表示
+                if c not in df.columns:
+                    df[c] = 0
+            col_order = ["担当者"] + items + ["合計"]
+            df = df[[c for c in col_order if c in df.columns]]
+            for c in items + ["合計"]:
+                if c in df.columns:
+                    df[c] = df[c].astype(int)
+            st.dataframe(df, use_container_width=True, hide_index=True)
 
     # ===== 管理者用：Notion同期 =====
     if notion_configured():

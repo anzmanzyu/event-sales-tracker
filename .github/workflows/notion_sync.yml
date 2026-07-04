@@ -1,0 +1,26 @@
+name: Notion Sync
+
+# Supabaseの全イベントをNotionへ定期同期する（夜の集計を自動化）
+on:
+  schedule:
+    # JST 9:00〜21:xx（UTC 0-12）に15分おき。イベント時間に合わせて調整可。
+    - cron: "*/15 0-12 * * *"
+  workflow_dispatch: {}  # 手動実行も可
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install deps
+        run: pip install supabase requests
+      - name: Sync to Notion
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+        run: python notion_sync.py
