@@ -625,12 +625,14 @@ def inject_css():
 
         /* ＋1 の大ボタン（primary） */
         div.stButton > button[kind="primary"] {
-            height: 5.4rem; font-size: 1.55rem; font-weight: 800;
+            height: 5.4rem; font-size: 1.95rem; font-weight: 800;
             border-radius: 18px; width: 100%; color: #fff;
-            white-space: pre-line; line-height: 1.2;
+            white-space: pre-line; line-height: 1.15;
             background: linear-gradient(180deg, #4F8DFD 0%, #3D6FE0 100%);
             box-shadow: 0 8px 20px rgba(79,141,253,0.28);
         }
+        /* 長い自由項目名がはみ出さないように少しだけ調整 */
+        div.stButton > button[kind="primary"] p { font-size: inherit; }
         div.stButton > button[kind="primary"]:hover { filter: brightness(1.07); }
 
         /* −1 修正（secondary） */
@@ -859,7 +861,7 @@ def render_main():
                 mine = my_counts.get(category, 0)
                 vtot = totals.get(category, 0)
                 if st.button(
-                    f"{icon} {category}　＋1",
+                    f"{icon} {category}",
                     key=f"plus_{slug}", type="primary", use_container_width=True,
                 ):
                     record_event(event_key, venue, staff, category, +1)
