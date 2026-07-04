@@ -624,17 +624,18 @@ def inject_css():
         div.stButton > button:active { transform: translateY(1px) scale(0.995); }
 
         /* ＋1 の大ボタン（primary） */
+        /* 枠（ボタンの箱）＝固定。文字サイズは下の --btn-font だけで調整する */
         div.stButton > button[kind="primary"] {
-            min-height: 3.2rem; height: auto; padding: 0.45rem 0.5rem;
-            font-size: 1.6rem; font-weight: 800;
-            border-radius: 14px; width: 100%; color: #fff;
+            height: 5rem; padding: 0.5rem 0.6rem;
+            font-weight: 800; border-radius: 16px; width: 100%; color: #fff;
             white-space: pre-line; line-height: 1.1;
             background: linear-gradient(180deg, #4F8DFD 0%, #3D6FE0 100%);
-            box-shadow: 0 6px 16px rgba(79,141,253,0.26);
+            box-shadow: 0 8px 20px rgba(79,141,253,0.28);
         }
-        /* ボタン内テキスト（Streamlitは<p>で包む）を確実に適用 */
+        /* ★文字サイズはここだけ変える（枠は上で固定）★ */
+        div.stButton > button[kind="primary"],
         div.stButton > button[kind="primary"] p,
-        div.stButton > button[kind="primary"] div { font-size: 1.6rem !important; font-weight: 800 !important; }
+        div.stButton > button[kind="primary"] div { font-size: 1.7rem !important; font-weight: 800 !important; }
         div.stButton > button[kind="primary"]:hover { filter: brightness(1.07); }
 
         /* −1 修正（secondary） */
