@@ -437,7 +437,7 @@ def _notion_date(period_start, period_end):
     return {"date": d}
 
 
-def _notion_props(venue, totals, total_all, staff_count, target, period_start, period_end, event_key):
+def _notion_props(venue, totals, staff_count, target, period_start, period_end, event_key):
     def num(v):
         return {"number": int(v)}
 
@@ -447,6 +447,8 @@ def _notion_props(venue, totals, total_all, staff_count, target, period_start, p
     # 固定以外（自由項目）を「機種変更×5, クレカ×3」形式の内訳テキストに集約
     customs = {c: v for c, v in totals.items() if c not in FIXED_CATEGORIES and v}
     naiyaku = ", ".join(f"{c}×{v}" for c, v in sorted(customs.items(), key=lambda x: -x[1]))
+    # 合計は固定KPI（MNP＋新規契約）のみ。自由項目は含めない
+    kpi_total = sum(totals.get(c, 0) for c in FIXED_CATEGORIES)
 
     return {
         "会場": {"title": [{"text": {"content": venue}}]},
@@ -456,7 +458,7 @@ def _notion_props(venue, totals, total_all, staff_count, target, period_start, p
         "MNP": num(totals.get("MNP", 0)),
         "新規契約": num(totals.get("新規契約", 0)),
         "内訳": txt(naiyaku),
-        "合計": num(total_all),
+        "合計": num(kpi_total),
         "更新時刻": txt(_now_local_iso()),
         "_key": txt(event_key),  # 会場×期間の一意キー（非表示推奨）
     }
@@ -479,11 +481,10 @@ def sync_event_to_notion(event_key: str) -> int:
         return 0
 
     totals = get_category_totals(event_key)
-    total_all = sum(totals.values())
     staff_count = len(get_breakdown(event_key))
 
     props = _notion_props(
-        meta["venue"], totals, total_all, staff_count,
+        meta["venue"], totals, staff_count,
         meta["target"], meta["period_start"], meta["period_end"], event_key,
     )
 
@@ -611,6 +612,11 @@ def inject_css():
         .st-key-plus_mnp    button[kind="primary"] { background: linear-gradient(180deg,#8B5CF6,#7248D9) !important; box-shadow:0 8px 20px rgba(139,92,246,0.30) !important; }
         .st-key-plus_shinki button[kind="primary"] { background: linear-gradient(180deg,#10B981,#0C9A6C) !important; box-shadow:0 8px 20px rgba(16,185,129,0.30) !important; }
         [class*="st-key-plus_c"] button[kind="primary"] { background: linear-gradient(180deg,#F59E0B,#D9860A) !important; box-shadow:0 8px 20px rgba(245,158,11,0.28) !important; }
+
+        /* ボタン下の獲得数表示（自分／会場） */
+        .catcnt { text-align:center; font-size:0.85rem; color:var(--muted); margin:4px 0 2px; }
+        .catcnt b { font-size:1.35rem; color:#fff; font-weight:800; margin:0 3px; }
+        .catcnt .sep { opacity:0.4; margin:0 6px; }
 
         /* 入力・セレクト・expander */
         [data-testid="stExpander"] { border: 1px solid var(--card-border); border-radius: 14px; background: var(--card); }
@@ -779,6 +785,7 @@ def render_main():
             key_map[c] = f"c{ci}"
             ci += 1
 
+    st.caption("ボタンをタップで ＋1／下の「−1 修正」で取り消し。数字は「自分／会場全体」")
     grid = [items[i:i + 2] for i in range(0, len(items), 2)]
     for row in grid:
         cols = st.columns(len(row))
@@ -786,18 +793,23 @@ def render_main():
             with col:
                 icon = FIXED_ICONS.get(category, CUSTOM_ICON)
                 slug = key_map[category]
-                current = my_counts.get(category, 0)
+                mine = my_counts.get(category, 0)
+                vtot = totals.get(category, 0)
                 if st.button(
-                    f"{icon} {category}\n＋1（現在 {current}）",
+                    f"{icon} {category}　＋1",
                     key=f"plus_{slug}", type="primary", use_container_width=True,
                 ):
                     record_event(event_key, venue, staff, category, +1)
                     st.rerun()
+                st.markdown(
+                    f"<div class='catcnt'>自分 <b>{mine}</b><span class='sep'>|</span>会場 <b>{vtot}</b></div>",
+                    unsafe_allow_html=True,
+                )
                 if st.button(
                     "−1 修正", key=f"minus_{slug}",
                     type="secondary", use_container_width=True,
                 ):
-                    if current > 0:
+                    if mine > 0:
                         record_event(event_key, venue, staff, category, -1)
                     st.rerun()
 
