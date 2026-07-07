@@ -107,6 +107,17 @@ def fmt_period(period_start: str, period_end: str) -> str:
     return s
 
 
+def fmt_jst(ts) -> str:
+    """created_at（ローカル/UTC iso）を 'MM/DD HH:MM'（JST）に整形。"""
+    try:
+        dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone(timedelta(hours=9)))
+        return dt.strftime("%m/%d %H:%M")
+    except Exception:
+        return str(ts)
+
+
 # ===========================================================================
 # データ層（バックエンド）
 #   config表（venues）: event_key(PK), venue, target, period_start, period_end
@@ -278,6 +289,18 @@ class SQLiteBackend:
             ).fetchall()
         return _aggregate_hourly(rows)
 
+    def list_event_records(self, event_key, limit=1000):
+        with closing(self._conn()) as conn:
+            rows = conn.execute(
+                "SELECT created_at, staff, category, delta FROM events "
+                "WHERE event_key = ? ORDER BY created_at DESC LIMIT ?",
+                (event_key, limit),
+            ).fetchall()
+        return [
+            {"created_at": r[0], "staff": r[1], "category": r[2], "delta": r[3]}
+            for r in rows
+        ]
+
     def get_breakdown(self, event_key):
         return _aggregate_breakdown(self._event_rows(event_key))
 
@@ -421,6 +444,25 @@ class SupabaseBackend:
             [(r["created_at"], r["category"], r["delta"]) for r in (res.data or [])]
         )
 
+    def list_event_records(self, event_key, limit=1000):
+        res = (
+            self.client.table("events")
+            .select("created_at,staff,category,delta")
+            .eq("event_key", event_key)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+        )
+        return [
+            {
+                "created_at": r.get("created_at"),
+                "staff": r["staff"],
+                "category": r["category"],
+                "delta": r["delta"],
+            }
+            for r in (res.data or [])
+        ]
+
     def get_breakdown(self, event_key):
         return _aggregate_breakdown(self._event_rows(event_key))
 
@@ -533,6 +575,10 @@ def list_notes(event_key, limit=50):
 
 def get_hourly_kpi(event_key):
     return get_backend().get_hourly_kpi(event_key)
+
+
+def list_event_records(event_key, limit=1000):
+    return get_backend().list_event_records(event_key, limit)
 
 
 def get_breakdown(event_key):
@@ -938,6 +984,30 @@ def render_setup():
             if hidden and not show_ended:
                 cap += f"　｜　終了（非表示）：{hidden}件"
             st.caption(cap + f"　（JST {today_jst} 基準）")
+
+        # ===== イベント別 実績ログ（プルダウンで選択・新しい順） =====
+        with st.expander("🧾 イベント別 実績ログ（新しい順）"):
+            import pandas as pd
+            labels = [f"{e['venue']}（{fmt_period(e['period_start'], e['period_end'])}）" for e in events]
+            idx = st.selectbox(
+                "イベントを選択", range(len(events)),
+                format_func=lambda i: labels[i], key="log_event_idx",
+            )
+            recs = list_event_records(events[idx]["event_key"])
+            if not recs:
+                st.caption("記録がありません。")
+            else:
+                df_log = pd.DataFrame([
+                    {
+                        "時刻": fmt_jst(r["created_at"]),
+                        "担当者": r["staff"],
+                        "項目": r["category"],
+                        "増減": "＋1" if r["delta"] > 0 else "−1",
+                    }
+                    for r in recs
+                ])
+                st.dataframe(df_log, use_container_width=True, hide_index=True)
+                st.caption(f"{len(recs)}件（新しい順・JST）")
 
     NEW_LABEL = "＋ 新しいイベント"
     labels = [NEW_LABEL] + [f"{e['venue']}（{fmt_period(e['period_start'], e['period_end'])}）" for e in events]
