@@ -950,64 +950,54 @@ def render_setup():
 
     events = list_events()
 
-    # ===== 全会場ダッシュボード（管理者向け・横断） =====
+    # ===== 全会場ダッシュボード（開催中は一覧／終了は会場ごとに履歴） =====
     if events:
-        with st.expander("📊 全会場ダッシュボード（横断）"):
-            import pandas as pd
-            # 日本時間の今日基準で「期間終了済み」を自動的に非表示（データは残す）
-            today_jst = datetime.now(timezone(timedelta(hours=9))).date().isoformat()
-            show_ended = st.checkbox("終了したイベントも表示", value=False)
-            shown = [
-                e for e in events
-                if show_ended or not e.get("period_end") or e["period_end"] >= today_jst
-            ]
-            rows = []
-            for e in shown:
-                t = get_category_totals(e["event_key"])
-                nm = sum(t.get(c, 0) for c in FIXED_CATEGORIES)
-                tgt = e["target"] or 0
-                ended = bool(e.get("period_end")) and e["period_end"] < today_jst
-                rows.append({
-                    "会場": e["venue"],
-                    "期間": fmt_period(e["period_start"], e["period_end"]),
-                    "新規＋MNP": nm,
-                    "目標": tgt,
-                    "達成率": f"{(nm / tgt * 100):.0f}%" if tgt else "—",
-                    "状態": "終了" if ended else "開催中",
-                })
-            if rows:
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        import pandas as pd
+        today_jst = datetime.now(timezone(timedelta(hours=9))).date().isoformat()
+        ongoing = [e for e in events if not e.get("period_end") or e["period_end"] >= today_jst]
+        ended = [e for e in events if e.get("period_end") and e["period_end"] < today_jst]
+
+        def _summary_row(e, with_venue=True):
+            t = get_category_totals(e["event_key"])
+            nm = sum(t.get(c, 0) for c in FIXED_CATEGORIES)
+            tgt = e["target"] or 0
+            row = {"期間": fmt_period(e["period_start"], e["period_end"]),
+                   "新規＋MNP": nm, "目標": tgt,
+                   "達成率": f"{(nm / tgt * 100):.0f}%" if tgt else "—"}
+            if with_venue:
+                return {"会場": e["venue"], **row}
+            return row
+
+        with st.expander("📊 全会場ダッシュボード（開催中）", expanded=True):
+            if ongoing:
+                st.dataframe(
+                    pd.DataFrame([_summary_row(e) for e in ongoing]),
+                    use_container_width=True, hide_index=True,
+                )
             else:
                 st.caption("開催中のイベントはありません。")
-            hidden = len(events) - len(shown)
-            cap = f"開催中：{len([e for e in shown if not (e.get('period_end') and e['period_end'] < today_jst)])}件"
-            if hidden and not show_ended:
-                cap += f"　｜　終了（非表示）：{hidden}件"
-            st.caption(cap + f"　（JST {today_jst} 基準）")
+            st.caption(f"（JST {today_jst} 基準）")
 
-        # ===== イベント別 実績ログ（プルダウンで選択・新しい順） =====
-        with st.expander("🧾 イベント別 実績ログ（新しい順）"):
-            import pandas as pd
-            labels = [f"{e['venue']}（{fmt_period(e['period_start'], e['period_end'])}）" for e in events]
-            idx = st.selectbox(
-                "イベントを選択", range(len(events)),
-                format_func=lambda i: labels[i], key="log_event_idx",
+        # 終了イベント：会場名だけ並べ、プルダウンで会場の数字履歴（新しい順）
+        if ended:
+            st.markdown("**🏁 終了した会場（会場ごとの履歴）**")
+            by_venue = {}
+            for e in ended:
+                by_venue.setdefault(e["venue"], []).append(e)
+            venues_sorted = sorted(
+                by_venue.items(),
+                key=lambda kv: max((e.get("period_start") or "") for e in kv[1]),
+                reverse=True,
             )
-            recs = list_event_records(events[idx]["event_key"])
-            if not recs:
-                st.caption("記録がありません。")
-            else:
-                df_log = pd.DataFrame([
-                    {
-                        "時刻": fmt_jst(r["created_at"]),
-                        "担当者": r["staff"],
-                        "項目": r["category"],
-                        "増減": "＋1" if r["delta"] > 0 else "−1",
-                    }
-                    for r in recs
-                ])
-                st.dataframe(df_log, use_container_width=True, hide_index=True)
-                st.caption(f"{len(recs)}件（新しい順・JST）")
+            for venue, evs in venues_sorted:
+                with st.expander(f"🏬 {venue}（{len(evs)}件）"):
+                    evs_sorted = sorted(
+                        evs, key=lambda x: (x.get("period_start") or ""), reverse=True
+                    )
+                    st.dataframe(
+                        pd.DataFrame([_summary_row(e, with_venue=False) for e in evs_sorted]),
+                        use_container_width=True, hide_index=True,
+                    )
 
     NEW_LABEL = "＋ 新しいイベント"
     labels = [NEW_LABEL] + [f"{e['venue']}（{fmt_period(e['period_start'], e['period_end'])}）" for e in events]
