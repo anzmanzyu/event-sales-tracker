@@ -84,6 +84,30 @@ def check_pin(entered: str) -> bool:
     return str(entered).strip() == str(conf.get("pin", "")).strip()
 
 
+def get_role(entered):
+    """合言葉から権限を判定。'admin' / 'staff' / None（不一致）。
+
+    - [auth]なし（ローカル）→ 全機能(admin)
+    - admin_pin一致 → admin
+    - pin一致 → admin_pin未設定なら後方互換でadmin、設定済みならstaff
+    """
+    conf = _secrets_section("auth")
+    if not conf:
+        return "admin"
+    e = str(entered).strip()
+    admin_pin = str(conf.get("admin_pin", "")).strip()
+    staff_pin = str(conf.get("pin", "")).strip()
+    if admin_pin and e == admin_pin:
+        return "admin"
+    if staff_pin and e == staff_pin:
+        return "staff" if admin_pin else "admin"
+    return None
+
+
+def is_admin() -> bool:
+    return st.session_state.get("role", "admin") == "admin"
+
+
 def _now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -928,8 +952,10 @@ def render_login():
         pin = st.text_input("合言葉 / PIN", type="password")
         ok = st.form_submit_button("入る", type="primary", use_container_width=True)
     if ok:
-        if check_pin(pin):
+        role = get_role(pin)
+        if role:
             st.session_state["authed"] = True
+            st.session_state["role"] = role
             st.rerun()
         else:
             st.error("合言葉が違います。")
@@ -950,8 +976,8 @@ def render_setup():
 
     events = list_events()
 
-    # ===== 全会場ダッシュボード（開催中は一覧／終了は会場ごとに履歴） =====
-    if events:
+    # ===== 全会場ダッシュボード（管理者のみ・開催中は一覧／終了は会場ごとに履歴） =====
+    if events and is_admin():
         import pandas as pd
         today_jst = datetime.now(timezone(timedelta(hours=9))).date().isoformat()
         ongoing = [e for e in events if not e.get("period_end") or e["period_end"] >= today_jst]
@@ -1015,7 +1041,14 @@ def render_setup():
                         )
 
     NEW_LABEL = "＋ 新しいイベント"
-    labels = [NEW_LABEL] + [f"{e['venue']}（{fmt_period(e['period_start'], e['period_end'])}）" for e in events]
+    # 続きから候補：会場ごとに最新イベント1件だけ（list_eventsは開始日の新しい順）
+    latest_by_venue = {}
+    for e in events:
+        latest_by_venue.setdefault(e["venue"], e)
+    dropdown_events = list(latest_by_venue.values())
+    labels = [NEW_LABEL] + [
+        f"{e['venue']}（{fmt_period(e['period_start'], e['period_end'])}）" for e in dropdown_events
+    ]
     # ダッシュボードの「選択」で入った値が古い場合は無効化（labelsに無ければ既定へ）
     if st.session_state.get("event_choice") not in labels:
         st.session_state.pop("event_choice", None)
@@ -1033,7 +1066,7 @@ def render_setup():
             help="この派遣期間トータルの「新規＋MNP」の目標件数です。",
         )
     else:
-        e = events[labels.index(choice) - 1]
+        e = dropdown_events[labels.index(choice) - 1]
         venue = e["venue"]
         period_start = date.fromisoformat(e["period_start"]) if e["period_start"] else today
         period_end = date.fromisoformat(e["period_end"]) if e["period_end"] else today
@@ -1290,6 +1323,10 @@ def render_main():
                 f"<span class='mx'>{n['text']}</span></div>",
                 unsafe_allow_html=True,
             )
+
+    # ここから下は管理者のみ（現場スタッフには非表示）
+    if not is_admin():
+        return
 
     # ===== 管理者メニュー（分析・AI） =====
     st.divider()
