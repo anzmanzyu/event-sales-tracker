@@ -22,7 +22,7 @@
 import os
 import sqlite3
 from contextlib import closing
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 # Streamlitはアプリ実行時のみ必要。Notion自動同期スクリプト（CI）では未使用なので
 # import できなくても動くようにガードする。
@@ -270,6 +270,14 @@ class SQLiteBackend:
             ).fetchall()
         return [{"staff": r[0], "text": r[1], "created_at": r[2]} for r in rows]
 
+    def get_hourly_kpi(self, event_key):
+        with closing(self._conn()) as conn:
+            rows = conn.execute(
+                "SELECT created_at, category, delta FROM events WHERE event_key = ?",
+                (event_key,),
+            ).fetchall()
+        return _aggregate_hourly(rows)
+
     def get_breakdown(self, event_key):
         return _aggregate_breakdown(self._event_rows(event_key))
 
@@ -402,8 +410,40 @@ class SupabaseBackend:
         except Exception:
             return []
 
+    def get_hourly_kpi(self, event_key):
+        res = (
+            self.client.table("events")
+            .select("created_at,category,delta")
+            .eq("event_key", event_key)
+            .execute()
+        )
+        return _aggregate_hourly(
+            [(r["created_at"], r["category"], r["delta"]) for r in (res.data or [])]
+        )
+
     def get_breakdown(self, event_key):
         return _aggregate_breakdown(self._event_rows(event_key))
+
+
+def _aggregate_hourly(rows) -> dict:
+    """(created_at, category, delta) から時間帯別の新規＋MNP件数を集計。
+
+    Supabaseの時刻はUTCなのでJST(+9)に変換してから時を取る。
+    戻り値: {hour(0-23): 件数}。
+    """
+    hours = {}
+    for ts, category, delta in rows:
+        if category not in FIXED_CATEGORIES:  # KPI（新規＋MNP）のみ
+            continue
+        try:
+            dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(timezone(timedelta(hours=9)))
+            h = dt.hour
+        except Exception:
+            continue
+        hours[h] = hours.get(h, 0) + int(delta)
+    return hours
 
 
 def _aggregate_breakdown(rows) -> list:
@@ -489,6 +529,10 @@ def add_note(event_key, staff, text):
 
 def list_notes(event_key, limit=50):
     return get_backend().list_notes(event_key, limit)
+
+
+def get_hourly_kpi(event_key):
+    return get_backend().get_hourly_kpi(event_key)
 
 
 def get_breakdown(event_key):
@@ -608,6 +652,85 @@ def sync_event_to_notion(event_key: str) -> int:
         )
     resp.raise_for_status()
     return 1
+
+
+# ===========================================================================
+# AI機能（Claude API）— 日報自動生成・メモ要約
+#   secretsに [ai] api_key があれば有効。無ければボタン非表示（no-op）。
+#   モデルは claude-opus-4-8。課金が発生するためOwner承認のうえキーを設定する。
+# ===========================================================================
+
+AI_MODEL = "claude-opus-4-8"
+
+
+def ai_configured() -> bool:
+    return _secrets_section("ai") is not None
+
+
+def _ai_client():
+    import anthropic  # 遅延import
+
+    conf = _secrets_section("ai")
+    return anthropic.Anthropic(api_key=conf["api_key"])
+
+
+def _ai_generate(prompt: str, max_tokens: int = 1500) -> str:
+    client = _ai_client()
+    resp = client.messages.create(
+        model=AI_MODEL,
+        max_tokens=max_tokens,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return "".join(b.text for b in resp.content if b.type == "text").strip()
+
+
+def _event_context_text(event_key: str) -> str:
+    """AIに渡すイベントの実績サマリー文字列を組み立てる。"""
+    meta = get_event_meta(event_key) or {}
+    totals = get_category_totals(event_key)
+    nm = sum(totals.get(c, 0) for c in FIXED_CATEGORIES)
+    customs = {c: v for c, v in totals.items() if c not in FIXED_CATEGORIES and v}
+    breakdown = get_breakdown(event_key)
+    lines = [
+        f"会場: {meta.get('venue', '')}",
+        f"期間: {fmt_period(meta.get('period_start'), meta.get('period_end'))}",
+        f"期間目標(新規+MNP): {meta.get('target', 0)}件",
+        f"新規+MNP 実績: {nm}件（MNP {totals.get('MNP', 0)} / 新規契約 {totals.get('新規契約', 0)}）",
+        f"その他内訳: {', '.join(f'{c}×{v}' for c, v in customs.items()) or 'なし'}",
+        "スタッフ別: " + "／".join(
+            f"{r['担当者']}(新規+MNP {r.get('MNP', 0) + r.get('新規契約', 0)})" for r in breakdown
+        ),
+    ]
+    return "\n".join(lines)
+
+
+def generate_daily_report(event_key: str) -> str:
+    """数字＋共有メモから、店長向けの日報テキストを生成する。"""
+    ctx = _event_context_text(event_key)
+    notes = list_notes(event_key)
+    memo = "\n".join(f"・{n['staff']}：{n['text']}" for n in notes[:20]) or "（メモなし）"
+    prompt = (
+        "あなたは携帯販売イベントの現場マネージャーです。以下の実績データと現場メモから、"
+        "本部提出用の日報を日本語で作成してください。事実にない数字は創作しないこと。"
+        "誇張・断定的な表現は避け、簡潔に。構成は【本日の実績サマリー】【所感・気づき】"
+        "【明日への申し送り】の3見出し。日報本文のみを出力（前置き不要）。\n\n"
+        f"# 実績データ\n{ctx}\n\n# 現場メモ\n{memo}"
+    )
+    return _ai_generate(prompt, max_tokens=1500)
+
+
+def summarize_notes(event_key: str) -> str:
+    """共有メモを「今日の会場傾向」に要約する。"""
+    notes = list_notes(event_key)
+    if not notes:
+        return "（メモがありません）"
+    memo = "\n".join(f"・{n['staff']}：{n['text']}" for n in notes[:40])
+    prompt = (
+        "以下は携帯販売イベント現場でスタッフが共有したメモです。会場の傾向・客層・"
+        "気づきを日本語で3〜5行に要約してください。事実にない内容は加えないこと。"
+        "要約本文のみを出力。\n\n" + memo
+    )
+    return _ai_generate(prompt, max_tokens=600)
 
 
 # ---------------------------------------------------------------------------
@@ -780,6 +903,26 @@ def render_setup():
     st.subheader("セッションを開始")
 
     events = list_events()
+
+    # ===== 全会場ダッシュボード（管理者向け・横断） =====
+    if events:
+        with st.expander("📊 全会場ダッシュボード（横断）"):
+            import pandas as pd
+            rows = []
+            for e in events:
+                t = get_category_totals(e["event_key"])
+                nm = sum(t.get(c, 0) for c in FIXED_CATEGORIES)
+                tgt = e["target"] or 0
+                rows.append({
+                    "会場": e["venue"],
+                    "期間": fmt_period(e["period_start"], e["period_end"]),
+                    "新規＋MNP": nm,
+                    "目標": tgt,
+                    "達成率": f"{(nm / tgt * 100):.0f}%" if tgt else "—",
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            st.caption(f"進行中/過去のイベント：{len(events)}件")
+
     NEW_LABEL = "＋ 新しいイベント"
     labels = [NEW_LABEL] + [f"{e['venue']}（{fmt_period(e['period_start'], e['period_end'])}）" for e in events]
     choice = st.selectbox("イベントを選択（続きから／新規）", labels)
@@ -1053,6 +1196,51 @@ def render_main():
                 f"<span class='mx'>{n['text']}</span></div>",
                 unsafe_allow_html=True,
             )
+
+    # ===== 管理者メニュー（分析・AI） =====
+    st.divider()
+    with st.expander("🛠 管理者メニュー（分析・AI）"):
+        # 時間帯別グラフ（新規＋MNP）
+        st.markdown("**⏰ 時間帯別の獲得（新規＋MNP）**")
+        hourly = get_hourly_kpi(event_key)
+        if hourly:
+            import pandas as pd
+            hs = sorted(hourly)
+            rng = range(hs[0], hs[-1] + 1)
+            df_h = pd.DataFrame(
+                {"新規＋MNP": [hourly.get(h, 0) for h in rng]},
+                index=[f"{h}時" for h in rng],
+            )
+            st.bar_chart(df_h)
+        else:
+            st.caption("まだ時間帯データがありません。")
+
+        # AI日報・メモ要約
+        st.divider()
+        if ai_configured():
+            c_ai1, c_ai2 = st.columns(2)
+            if c_ai1.button("📝 AI日報を生成", use_container_width=True):
+                with st.spinner("AIが日報を作成中…"):
+                    try:
+                        st.session_state["ai_report"] = generate_daily_report(event_key)
+                    except Exception as e:
+                        st.session_state["ai_report"] = f"生成に失敗しました: {e}"
+                st.rerun()
+            if c_ai2.button("🧠 メモをAI要約", use_container_width=True):
+                with st.spinner("AIが要約中…"):
+                    try:
+                        st.session_state["ai_summary"] = summarize_notes(event_key)
+                    except Exception as e:
+                        st.session_state["ai_summary"] = f"要約に失敗しました: {e}"
+                st.rerun()
+            if st.session_state.get("ai_summary"):
+                st.markdown("**🧠 メモ要約**")
+                st.info(st.session_state["ai_summary"])
+            if st.session_state.get("ai_report"):
+                st.markdown("**📝 AI日報**")
+                st.text_area("日報（コピーして提出）", st.session_state["ai_report"], height=300)
+        else:
+            st.caption("AI日報・メモ要約は、AnthropicのAPIキー設定後に有効になります（課金・管理者設定）。")
 
     # ===== 管理者用：Notion同期 =====
     if notion_configured():

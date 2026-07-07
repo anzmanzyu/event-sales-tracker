@@ -6,3 +6,5 @@ streamlit-autorefresh>=1.0.1
 supabase>=2.4
 # 本番: Notion同期
 requests>=2.31
+# AI機能（日報生成・メモ要約）※APIキー設定時のみ課金・動作
+anthropic>=0.40
