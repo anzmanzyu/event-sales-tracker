@@ -970,17 +970,31 @@ def render_setup():
 
         with st.expander("📊 全会場ダッシュボード（開催中）", expanded=True):
             if ongoing:
-                st.dataframe(
-                    pd.DataFrame([_summary_row(e) for e in ongoing]),
-                    use_container_width=True, hide_index=True,
-                )
+                st.caption("「選択」を押すとそのイベントで開始できます。")
+                for e in ongoing:
+                    t = get_category_totals(e["event_key"])
+                    nm = sum(t.get(c, 0) for c in FIXED_CATEGORIES)
+                    tgt = e["target"] or 0
+                    period = fmt_period(e["period_start"], e["period_end"])
+                    c1, c2, c3 = st.columns([4, 3, 1.6])
+                    c1.markdown(
+                        f"**🏬 {e['venue']}**<br>"
+                        f"<span style='color:#9AA6BF;font-size:0.78rem'>{period}</span>",
+                        unsafe_allow_html=True,
+                    )
+                    c2.markdown(
+                        f"新規＋MNP **{nm}** / {tgt}"
+                        + (f"（{nm / tgt * 100:.0f}%）" if tgt else "")
+                    )
+                    if c3.button("選択", key=f"pick_{e['event_key']}", use_container_width=True):
+                        st.session_state["event_choice"] = f"{e['venue']}（{period}）"
+                        st.rerun()
             else:
                 st.caption("開催中のイベントはありません。")
             st.caption(f"（JST {today_jst} 基準）")
 
-        # 終了イベント：会場名だけ並べ、プルダウンで会場の数字履歴（新しい順）
+        # 終了イベント：1つのプルダウンにまとめ、中で会場ごとに開閉（数字履歴・新しい順）
         if ended:
-            st.markdown("**🏁 終了した会場（会場ごとの履歴）**")
             by_venue = {}
             for e in ended:
                 by_venue.setdefault(e["venue"], []).append(e)
@@ -989,19 +1003,23 @@ def render_setup():
                 key=lambda kv: max((e.get("period_start") or "") for e in kv[1]),
                 reverse=True,
             )
-            for venue, evs in venues_sorted:
-                with st.expander(f"🏬 {venue}（{len(evs)}件）"):
-                    evs_sorted = sorted(
-                        evs, key=lambda x: (x.get("period_start") or ""), reverse=True
-                    )
-                    st.dataframe(
-                        pd.DataFrame([_summary_row(e, with_venue=False) for e in evs_sorted]),
-                        use_container_width=True, hide_index=True,
-                    )
+            with st.expander(f"🏁 終了した会場（{len(venues_sorted)}会場）", expanded=False):
+                for venue, evs in venues_sorted:
+                    if st.checkbox(f"🏬 {venue}（{len(evs)}件）", key=f"ended_{venue}"):
+                        evs_sorted = sorted(
+                            evs, key=lambda x: (x.get("period_start") or ""), reverse=True
+                        )
+                        st.dataframe(
+                            pd.DataFrame([_summary_row(e, with_venue=False) for e in evs_sorted]),
+                            use_container_width=True, hide_index=True,
+                        )
 
     NEW_LABEL = "＋ 新しいイベント"
     labels = [NEW_LABEL] + [f"{e['venue']}（{fmt_period(e['period_start'], e['period_end'])}）" for e in events]
-    choice = st.selectbox("イベントを選択（続きから／新規）", labels)
+    # ダッシュボードの「選択」で入った値が古い場合は無効化（labelsに無ければ既定へ）
+    if st.session_state.get("event_choice") not in labels:
+        st.session_state.pop("event_choice", None)
+    choice = st.selectbox("イベントを選択（続きから／新規）", labels, key="event_choice")
 
     today = date.today()
     if choice == NEW_LABEL:
