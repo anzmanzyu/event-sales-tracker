@@ -908,20 +908,36 @@ def render_setup():
     if events:
         with st.expander("📊 全会場ダッシュボード（横断）"):
             import pandas as pd
+            # 日本時間の今日基準で「期間終了済み」を自動的に非表示（データは残す）
+            today_jst = datetime.now(timezone(timedelta(hours=9))).date().isoformat()
+            show_ended = st.checkbox("終了したイベントも表示", value=False)
+            shown = [
+                e for e in events
+                if show_ended or not e.get("period_end") or e["period_end"] >= today_jst
+            ]
             rows = []
-            for e in events:
+            for e in shown:
                 t = get_category_totals(e["event_key"])
                 nm = sum(t.get(c, 0) for c in FIXED_CATEGORIES)
                 tgt = e["target"] or 0
+                ended = bool(e.get("period_end")) and e["period_end"] < today_jst
                 rows.append({
                     "会場": e["venue"],
                     "期間": fmt_period(e["period_start"], e["period_end"]),
                     "新規＋MNP": nm,
                     "目標": tgt,
                     "達成率": f"{(nm / tgt * 100):.0f}%" if tgt else "—",
+                    "状態": "終了" if ended else "開催中",
                 })
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-            st.caption(f"進行中/過去のイベント：{len(events)}件")
+            if rows:
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            else:
+                st.caption("開催中のイベントはありません。")
+            hidden = len(events) - len(shown)
+            cap = f"開催中：{len([e for e in shown if not (e.get('period_end') and e['period_end'] < today_jst)])}件"
+            if hidden and not show_ended:
+                cap += f"　｜　終了（非表示）：{hidden}件"
+            st.caption(cap + f"　（JST {today_jst} 基準）")
 
     NEW_LABEL = "＋ 新しいイベント"
     labels = [NEW_LABEL] + [f"{e['venue']}（{fmt_period(e['period_start'], e['period_end'])}）" for e in events]
