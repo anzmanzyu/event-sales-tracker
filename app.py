@@ -232,12 +232,13 @@ class SQLiteBackend:
         with closing(self._conn()) as conn:
             rows = conn.execute(
                 """
-                SELECT event_key, venue, period_start, period_end, target
+                SELECT event_key, venue, period_start, period_end, target, updated_at
                 FROM venues ORDER BY period_start DESC, venue
                 """
             ).fetchall()
         return [
-            {"event_key": r[0], "venue": r[1], "period_start": r[2], "period_end": r[3], "target": int(r[4])}
+            {"event_key": r[0], "venue": r[1], "period_start": r[2], "period_end": r[3],
+             "target": int(r[4]), "updated_at": r[5]}
             for r in rows
         ]
 
@@ -369,7 +370,7 @@ class SupabaseBackend:
     def list_events(self):
         res = (
             self.client.table("venues")
-            .select("event_key,venue,period_start,period_end,target")
+            .select("event_key,venue,period_start,period_end,target,updated_at")
             .order("period_start", desc=True)
             .execute()
         )
@@ -380,6 +381,7 @@ class SupabaseBackend:
                 "period_start": r.get("period_start"),
                 "period_end": r.get("period_end"),
                 "target": int(r["target"]),
+                "updated_at": r.get("updated_at"),
             }
             for r in (res.data or [])
         ]
@@ -1024,15 +1026,16 @@ def render_setup():
             by_venue = {}
             for e in ended:
                 by_venue.setdefault(e["venue"], []).append(e)
-            venues_sorted = sorted(
-                by_venue.items(),
-                key=lambda kv: max((e.get("period_start") or "") for e in kv[1]),
-                reverse=True,
-            )
+            # 会場ごとの最終更新（updated_at）で並べ替え・表示
+            last_upd = {v: max((e.get("updated_at") or "") for e in evs) for v, evs in by_venue.items()}
+            venues_sorted = sorted(by_venue.items(), key=lambda kv: last_upd[kv[0]], reverse=True)
             with st.expander(f"🏁 終了した会場（{len(venues_sorted)}会場）", expanded=False):
                 venue_map = dict(venues_sorted)
                 sel_venue = st.selectbox(
-                    "会場を選択", [v for v, _ in venues_sorted], key="ended_venue_sel"
+                    "会場を選択（最終更新の新しい順）",
+                    [v for v, _ in venues_sorted],
+                    key="ended_venue_sel",
+                    format_func=lambda v: f"{v}（{fmt_jst(last_upd[v])}）",
                 )
                 evs = venue_map[sel_venue]
                 evs_sorted = sorted(
