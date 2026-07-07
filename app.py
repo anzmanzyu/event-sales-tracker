@@ -154,6 +154,18 @@ class SQLiteBackend:
                 """
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_events_key ON events(event_key)")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS notes (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_key  TEXT NOT NULL,
+                    staff      TEXT NOT NULL,
+                    text       TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_key ON notes(event_key)")
 
     def set_event(self, event_key, venue, target, period_start, period_end):
         with closing(self._conn()) as conn, conn:
@@ -241,6 +253,22 @@ class SQLiteBackend:
                 "SELECT DISTINCT staff FROM events WHERE venue = ?", (venue,)
             ).fetchall()
         return [r[0] for r in rows]
+
+    def add_note(self, event_key, staff, text):
+        with closing(self._conn()) as conn, conn:
+            conn.execute(
+                "INSERT INTO notes (event_key, staff, text, created_at) VALUES (?, ?, ?, ?)",
+                (event_key, staff, text, _now_local_iso()),
+            )
+
+    def list_notes(self, event_key, limit=50):
+        with closing(self._conn()) as conn:
+            rows = conn.execute(
+                "SELECT staff, text, created_at FROM notes WHERE event_key = ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (event_key, limit),
+            ).fetchall()
+        return [{"staff": r[0], "text": r[1], "created_at": r[2]} for r in rows]
 
     def get_breakdown(self, event_key):
         return _aggregate_breakdown(self._event_rows(event_key))
@@ -351,6 +379,29 @@ class SupabaseBackend:
                 seen.append(r["staff"])
         return seen
 
+    def add_note(self, event_key, staff, text):
+        self.client.table("notes").insert(
+            {"event_key": event_key, "staff": staff, "text": text, "created_at": _now_utc_iso()}
+        ).execute()
+
+    def list_notes(self, event_key, limit=50):
+        # notesテーブル未作成でもアプリが落ちないよう防御
+        try:
+            res = (
+                self.client.table("notes")
+                .select("staff,text,created_at")
+                .eq("event_key", event_key)
+                .order("created_at", desc=True)
+                .limit(limit)
+                .execute()
+            )
+            return [
+                {"staff": r["staff"], "text": r["text"], "created_at": r.get("created_at")}
+                for r in (res.data or [])
+            ]
+        except Exception:
+            return []
+
     def get_breakdown(self, event_key):
         return _aggregate_breakdown(self._event_rows(event_key))
 
@@ -432,6 +483,14 @@ def list_venue_staff(venue):
     return get_backend().list_venue_staff(venue)
 
 
+def add_note(event_key, staff, text):
+    get_backend().add_note(event_key, staff, text)
+
+
+def list_notes(event_key, limit=50):
+    return get_backend().list_notes(event_key, limit)
+
+
 def get_breakdown(event_key):
     return get_backend().get_breakdown(event_key)
 
@@ -468,12 +527,12 @@ def _notion_date(period_start, period_end):
     return {"date": d}
 
 
-def _notion_props(venue, totals, staff_count, target, period_start, period_end, event_key):
+def _notion_props(venue, totals, staff_count, target, period_start, period_end, event_key, memo=""):
     def num(v):
         return {"number": int(v)}
 
     def txt(v):
-        return {"rich_text": [{"text": {"content": str(v)}}]}
+        return {"rich_text": [{"text": {"content": str(v)[:1900]}}]}
 
     # 固定以外（自由項目）を「機種変更×5, クレカ×3」形式の内訳テキストに集約
     customs = {c: v for c, v in totals.items() if c not in FIXED_CATEGORIES and v}
@@ -492,6 +551,7 @@ def _notion_props(venue, totals, staff_count, target, period_start, period_end, 
         "新規契約": num(totals.get("新規契約", 0)),
         "内訳": txt(naiyaku),
         "合計": num(kpi_total),
+        "メモ": txt(memo),
         "更新時刻": txt(_now_local_iso()),
         "_key": txt(event_key),  # 会場×期間の一意キー（非表示推奨）
     }
@@ -516,9 +576,13 @@ def sync_event_to_notion(event_key: str) -> int:
     totals = get_category_totals(event_key)
     staff_count = len(get_breakdown(event_key))
 
+    # 共有メモを新しい順に集約（Notion「メモ」列へ）
+    notes = list_notes(event_key)
+    memo = "\n".join(f"・{n['staff']}：{n['text']}" for n in notes[:15])
+
     props = _notion_props(
         meta["venue"], totals, staff_count,
-        meta["target"], meta["period_start"], meta["period_end"], event_key,
+        meta["target"], meta["period_start"], meta["period_end"], event_key, memo,
     )
 
     query = requests.post(
@@ -664,6 +728,13 @@ def inject_css():
         .rankrow .rv { color:var(--muted); font-size:0.85rem; white-space:nowrap; }
         .rankrow .rv b { color:#22C55E; font-size:1.2rem; margin:0 2px; }
 
+        /* 共有メモ */
+        .memorow { padding:9px 12px; margin-bottom:6px; background:var(--card);
+            border:1px solid var(--card-border); border-radius:12px; }
+        .memorow .mt { color:var(--muted); font-size:0.72rem; margin-right:8px; }
+        .memorow .ms { color:#4F8DFD; font-weight:700; font-size:0.85rem; margin-right:8px; }
+        .memorow .mx { color:#E7ECF3; }
+
         /* 入力・セレクト・expander */
         [data-testid="stExpander"] { border: 1px solid var(--card-border); border-radius: 14px; background: var(--card); }
         [data-testid="stDataFrame"] { border-radius: 12px; overflow: hidden; }
@@ -775,7 +846,8 @@ def render_main():
     staff = st.session_state["staff"]
 
     adding = st.session_state.get("adding_item", False)
-    if not adding:  # 項目追加中は自動更新を止める（入力中のフォーカス喪失を防止）
+    memo_mode = st.session_state.get("memo_mode", False)
+    if not (adding or memo_mode):  # 入力・メモ記入中は自動更新を止める（フォーカス喪失防止）
         do_autorefresh(AUTO_REFRESH_MS, key="dashboard_refresh")
 
     meta = get_event_meta(event_key) or {}
@@ -940,6 +1012,47 @@ def render_main():
                 if c in df.columns:
                     df[c] = df[c].astype(int)
             st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ===== 共有メモ（会場の雰囲気・客層・気づき）=====
+    st.markdown("### 📝 共有メモ")
+    if not memo_mode:
+        if st.button("＋ メモを書く"):
+            st.session_state["memo_mode"] = True
+            st.rerun()
+    else:
+        st.caption("会場の雰囲気・お客様の層・気づいたことなど。記入中は自動更新を止めています。")
+        memo_text = st.text_area("メモ", key="memo_input", height=100,
+                                 placeholder="例：夕方から家族連れが増加。学割訴求が刺さる。")
+        b1, b2 = st.columns(2)
+        if b1.button("投稿する", type="primary", use_container_width=True):
+            t = (memo_text or "").strip()
+            if not t:
+                st.error("メモを入力してください。")
+            else:
+                try:
+                    add_note(event_key, staff, t)
+                    st.session_state["memo_mode"] = False
+                    st.rerun()
+                except Exception:
+                    st.error("メモの保存に失敗しました（Supabaseにnotesテーブルが未作成の可能性）。管理者にご連絡ください。")
+        if b2.button("キャンセル", use_container_width=True):
+            st.session_state["memo_mode"] = False
+            st.rerun()
+
+    notes = list_notes(event_key)
+    if not notes:
+        st.caption("まだメモはありません。")
+    else:
+        for n in notes[:30]:
+            ts = (n.get("created_at") or "").replace("T", " ")[5:16]  # MM-DD HH:MM
+            st.markdown(
+                f"<div class='memorow'><span class='mt'>{ts}</span>"
+                f"<span class='ms'>{n['staff']}</span>"
+                f"<span class='mx'>{n['text']}</span></div>",
+                unsafe_allow_html=True,
+            )
 
     # ===== 管理者用：Notion同期 =====
     if notion_configured():

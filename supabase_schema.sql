@@ -36,12 +36,25 @@ create table public.events (
 create index if not exists idx_events_key on public.events (event_key);
 create index if not exists idx_events_key_staff on public.events (event_key, staff);
 
+-- 共有メモ（会場の雰囲気・客層・気づき等をスタッフ間で共有）
+create table if not exists public.notes (
+    id         bigint generated always as identity primary key,
+    event_key  text not null,
+    staff      text not null,
+    text       text not null,
+    created_at timestamptz not null default now()
+);
+create index if not exists idx_notes_key on public.notes (event_key);
+
 -- RLS（anon で読み書き。events は削除不可＝改ざん防止）
 alter table public.venues enable row level security;
 alter table public.events enable row level security;
+alter table public.notes  enable row level security;
 
 create policy "anon read venues"   on public.venues for select to anon using (true);
 create policy "anon upsert venues" on public.venues for insert to anon with check (true);
 create policy "anon update venues" on public.venues for update to anon using (true) with check (true);
 create policy "anon read events"   on public.events for select to anon using (true);
 create policy "anon insert events" on public.events for insert to anon with check (true);
+create policy "anon read notes"    on public.notes  for select to anon using (true);
+create policy "anon insert notes"  on public.notes  for insert to anon with check (true);
