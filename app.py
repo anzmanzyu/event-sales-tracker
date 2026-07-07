@@ -1331,7 +1331,19 @@ def render_main():
                 unsafe_allow_html=True,
             )
 
-    # ここから下は管理者のみ（現場スタッフには非表示）
+    # ===== Notionへ手動送信（現場スタッフも利用可） =====
+    if notion_configured():
+        st.divider()
+        with st.expander("🗂 Notionへ手動送信"):
+            st.caption("このイベント（会場×期間）の合計をNotionへ送信します（報告用）。")
+            if st.button("今すぐNotionに送信する"):
+                try:
+                    n = sync_event_to_notion(event_key)
+                    st.success(f"Notionへ {n} 件送信しました。")
+                except Exception as e:
+                    st.error(f"送信に失敗しました: {e}")
+
+    # ここから下は管理者のみ（分析・AI・ダッシュボード）
     if not is_admin():
         return
 
@@ -1379,18 +1391,6 @@ def render_main():
                 st.text_area("日報（コピーして提出）", st.session_state["ai_report"], height=300)
         else:
             st.caption("AI日報・メモ要約は、AnthropicのAPIキー設定後に有効になります（課金・管理者設定）。")
-
-    # ===== 管理者用：Notion同期 =====
-    if notion_configured():
-        st.divider()
-        with st.expander("🗂 管理者用：Notionへ同期"):
-            st.caption("このイベント（会場×期間）の合計をNotionへ送信します（報告用）。")
-            if st.button("今すぐNotionに同期する"):
-                try:
-                    n = sync_event_to_notion(event_key)
-                    st.success(f"Notionへ {n} 件同期しました。")
-                except Exception as e:
-                    st.error(f"同期に失敗しました: {e}")
 
 
 # ---------------------------------------------------------------------------
