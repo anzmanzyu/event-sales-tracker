@@ -201,6 +201,16 @@ class SQLiteBackend:
                 """
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_notes_key ON notes(event_key)")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS hidden_items (
+                    event_key  TEXT NOT NULL,
+                    category   TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(event_key, category)
+                )
+                """
+            )
 
     def set_event(self, event_key, venue, target, period_start, period_end):
         with closing(self._conn()) as conn, conn:
@@ -328,6 +338,28 @@ class SQLiteBackend:
 
     def get_breakdown(self, event_key):
         return _aggregate_breakdown(self._event_rows(event_key))
+
+    def hide_category(self, event_key, category):
+        with closing(self._conn()) as conn, conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO hidden_items (event_key, category, created_at) "
+                "VALUES (?, ?, ?)",
+                (event_key, category, _now_local_iso()),
+            )
+
+    def unhide_category(self, event_key, category):
+        with closing(self._conn()) as conn, conn:
+            conn.execute(
+                "DELETE FROM hidden_items WHERE event_key = ? AND category = ?",
+                (event_key, category),
+            )
+
+    def list_hidden(self, event_key):
+        with closing(self._conn()) as conn:
+            rows = conn.execute(
+                "SELECT category FROM hidden_items WHERE event_key = ?", (event_key,)
+            ).fetchall()
+        return [r[0] for r in rows]
 
 
 class SupabaseBackend:
@@ -492,6 +524,38 @@ class SupabaseBackend:
     def get_breakdown(self, event_key):
         return _aggregate_breakdown(self._event_rows(event_key))
 
+    def hide_category(self, event_key, category):
+        # hidden_items未作成なら例外→呼び出し側でフォロー
+        self.client.table("hidden_items").upsert(
+            {"event_key": event_key, "category": category},
+            on_conflict="event_key,category",
+        ).execute()
+
+    def unhide_category(self, event_key, category):
+        try:
+            (
+                self.client.table("hidden_items")
+                .delete()
+                .eq("event_key", event_key)
+                .eq("category", category)
+                .execute()
+            )
+        except Exception:
+            pass
+
+    def list_hidden(self, event_key):
+        # hidden_itemsテーブル未作成でもアプリが落ちないよう防御
+        try:
+            res = (
+                self.client.table("hidden_items")
+                .select("category")
+                .eq("event_key", event_key)
+                .execute()
+            )
+            return [r["category"] for r in (res.data or [])]
+        except Exception:
+            return []
+
 
 def _aggregate_hourly(rows) -> dict:
     """(created_at, category, delta) から時間帯別の新規＋MNP件数を集計。
@@ -609,6 +673,18 @@ def list_event_records(event_key, limit=1000):
 
 def get_breakdown(event_key):
     return get_backend().get_breakdown(event_key)
+
+
+def hide_category(event_key, category):
+    get_backend().hide_category(event_key, category)
+
+
+def unhide_category(event_key, category):
+    get_backend().unhide_category(event_key, category)
+
+
+def list_hidden(event_key):
+    return get_backend().list_hidden(event_key)
 
 
 # ===========================================================================
@@ -1124,7 +1200,10 @@ def render_main():
 
     adding = st.session_state.get("adding_item", False)
     memo_mode = st.session_state.get("memo_mode", False)
-    if not (adding or memo_mode):  # 入力・メモ記入中は自動更新を止める（フォーカス喪失防止）
+    bulk_mode = st.session_state.get("bulk_mode", False)
+    delete_mode = st.session_state.get("delete_mode", False)
+    # 入力・メモ記入・まとめて入力・削除操作中は自動更新を止める（フォーカス喪失防止）
+    if not (adding or memo_mode or bulk_mode or delete_mode):
         do_autorefresh(AUTO_REFRESH_MS, key="dashboard_refresh")
 
     meta = get_event_meta(event_key) or {}
@@ -1173,8 +1252,13 @@ def render_main():
     my_counts = get_my_counts(event_key, staff)
 
     # 表示する項目 = 固定(MNP/新規) ＋ この会場で過去に使われた自由項目 ＋ 今セッションで追加した項目
-    venue_cats = [c for c in list_venue_categories(venue) if c not in FIXED_CATEGORIES]
-    session_new = st.session_state.get("new_items", [])
+    # （このイベントで「削除」した自由項目は hidden で除外）
+    hidden = set(list_hidden(event_key))
+    venue_cats = [
+        c for c in list_venue_categories(venue)
+        if c not in FIXED_CATEGORIES and c not in hidden
+    ]
+    session_new = [c for c in st.session_state.get("new_items", []) if c not in hidden]
     custom_items = []
     for c in venue_cats + session_new:
         if c not in custom_items:
@@ -1232,6 +1316,26 @@ def render_main():
 
     st.caption(f"あなたの合計：{sum(my_counts.values())} 件")
 
+    # ===== まとめて入力（数量を指定して一括登録・連打の代わり）=====
+    if not bulk_mode:
+        if st.button("🔢 まとめて入力（4件などを一度に）"):
+            st.session_state["bulk_mode"] = True
+            st.rerun()
+    else:
+        st.markdown("**🔢 まとめて入力**")
+        st.caption("獲得した数をまとめて登録できます（ボタン連打の代わり）。入力中は自動更新を止めています。")
+        b1, b2 = st.columns([2, 1])
+        bulk_cat = b1.selectbox("商材", items, key="bulk_cat")
+        bulk_qty = b2.number_input("件数", min_value=1, max_value=999, value=1, step=1, key="bulk_qty")
+        z1, z2 = st.columns(2)
+        if z1.button("この件数で追加", type="primary", use_container_width=True):
+            record_event(event_key, venue, staff, bulk_cat, int(bulk_qty))
+            st.session_state["bulk_mode"] = False
+            st.rerun()
+        if z2.button("キャンセル", key="bulk_cancel", use_container_width=True):
+            st.session_state["bulk_mode"] = False
+            st.rerun()
+
     # ===== 自由項目の追加（追加中は自動更新を停止）=====
     if not adding:
         if st.button("＋ 項目を追加（自由入力）"):
@@ -1250,11 +1354,48 @@ def render_main():
                 st.warning("その項目はすでに使われています。")
             else:
                 st.session_state.setdefault("new_items", []).append(name)
+                try:  # 以前このイベントで「削除（非表示）」した項目なら復活させる
+                    unhide_category(event_key, name)
+                except Exception:
+                    pass
                 st.session_state["adding_item"] = False
                 st.rerun()
         if a2.button("キャンセル", use_container_width=True):
             st.session_state["adding_item"] = False
             st.rerun()
+
+    # ===== 自由項目の削除（未使用のみ・入力欄から非表示。件数データは残る）=====
+    deletable = [c for c in custom_items if totals.get(c, 0) == 0]
+    if deletable:
+        if not delete_mode:
+            if st.button("🗑 商材を削除（未使用のみ）"):
+                st.session_state["delete_mode"] = True
+                st.rerun()
+        else:
+            st.markdown("**🗑 商材を削除**")
+            st.caption("入力欄から消す商材を選んでください。件数が入っている商材は誤削除防止のため表示されません（データは残ります）。")
+            for c in deletable:
+                d1, d2 = st.columns([3, 1])
+                d1.markdown(
+                    f"<div style='padding-top:6px'>{CUSTOM_ICON} {c}</div>",
+                    unsafe_allow_html=True,
+                )
+                if d2.button("削除", key=f"del_{c}", use_container_width=True):
+                    ok = True
+                    if c in venue_cats:  # DBに履歴がある項目は非表示レコードで永続化
+                        try:
+                            hide_category(event_key, c)
+                        except Exception:
+                            ok = False
+                            st.error("この商材の削除にはSupabase側の準備が必要です（管理者にご連絡ください）。")
+                    if ok:
+                        st.session_state["new_items"] = [
+                            x for x in st.session_state.get("new_items", []) if x != c
+                        ]
+                        st.rerun()
+            if st.button("完了", key="del_done", type="primary", use_container_width=True):
+                st.session_state["delete_mode"] = False
+                st.rerun()
 
     st.divider()
 

@@ -58,3 +58,25 @@ create policy "anon read events"   on public.events for select to anon using (tr
 create policy "anon insert events" on public.events for insert to anon with check (true);
 create policy "anon read notes"    on public.notes  for select to anon using (true);
 create policy "anon insert notes"  on public.notes  for insert to anon with check (true);
+
+-- =====================================================================
+-- 非表示商材（自由項目を入力欄から消す＝件数データは events に残したまま非表示）
+--   ⚠️ この下のブロックだけを SQL Editor で実行すれば追加できます
+--      （上の drop 文は実行しないこと。既存データが消えます）
+-- =====================================================================
+create table if not exists public.hidden_items (
+    id         bigint generated always as identity primary key,
+    event_key  text not null,
+    category   text not null,
+    created_at timestamptz not null default now(),
+    unique (event_key, category)
+);
+create index if not exists idx_hidden_key on public.hidden_items (event_key);
+
+alter table public.hidden_items enable row level security;
+drop policy if exists "anon read hidden"   on public.hidden_items;
+drop policy if exists "anon insert hidden" on public.hidden_items;
+drop policy if exists "anon delete hidden" on public.hidden_items;
+create policy "anon read hidden"   on public.hidden_items for select to anon using (true);
+create policy "anon insert hidden" on public.hidden_items for insert to anon with check (true);
+create policy "anon delete hidden" on public.hidden_items for delete to anon using (true);
