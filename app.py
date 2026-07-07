@@ -1030,15 +1030,19 @@ def render_setup():
                 reverse=True,
             )
             with st.expander(f"🏁 終了した会場（{len(venues_sorted)}会場）", expanded=False):
-                for venue, evs in venues_sorted:
-                    if st.checkbox(f"🏬 {venue}（{len(evs)}件）", key=f"ended_{venue}"):
-                        evs_sorted = sorted(
-                            evs, key=lambda x: (x.get("period_start") or ""), reverse=True
-                        )
-                        st.dataframe(
-                            pd.DataFrame([_summary_row(e, with_venue=False) for e in evs_sorted]),
-                            use_container_width=True, hide_index=True,
-                        )
+                venue_map = dict(venues_sorted)
+                sel_venue = st.selectbox(
+                    "会場を選択", [v for v, _ in venues_sorted], key="ended_venue_sel"
+                )
+                evs = venue_map[sel_venue]
+                evs_sorted = sorted(
+                    evs, key=lambda x: (x.get("period_start") or ""), reverse=True
+                )
+                st.caption(f"🏬 {sel_venue}（{len(evs)}件・新しい順）")
+                st.dataframe(
+                    pd.DataFrame([_summary_row(e, with_venue=False) for e in evs_sorted]),
+                    use_container_width=True, hide_index=True,
+                )
 
     NEW_LABEL = "＋ 新しいイベント"
     # 続きから候補：会場ごとに最新イベント1件だけ（list_eventsは開始日の新しい順）
