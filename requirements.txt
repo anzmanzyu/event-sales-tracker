@@ -1,10 +1,21 @@
-streamlit>=1.33
-pandas>=2.0
+# ⚠ バージョン固定（2026-07-13）
+# 未固定(>=)にしていたため、Streamlit Cloud が Python 3.14 + pandas 3.0 系で
+# 再ビルドし、native層が Segmentation fault → 起動不能になった。
+# 【重要】Streamlit Cloud の Settings で Python version を 3.12 に固定すること。
+#         （3.14 のままだと下記の安定版wheelが無く、ビルドに失敗する）
+
+streamlit>=1.37,<1.50
+pandas>=2.0,<2.3
+numpy>=1.26,<2.2
+
 # 画面自動更新（無くてもJSリロードのフォールバックが動く）
-streamlit-autorefresh>=1.0.1
+streamlit-autorefresh==1.0.1
+
 # 本番: Supabase(リアルタイムDB)
-supabase>=2.4
+supabase>=2.4,<2.16
+
 # 本番: Notion同期
-requests>=2.31
+requests>=2.31,<3
+
 # AI機能（日報生成・メモ要約）※APIキー設定時のみ課金・動作
-anthropic>=0.40
+anthropic>=0.40,<1.0
